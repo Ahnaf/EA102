@@ -1,331 +1,246 @@
-﻿//+------------------------------------------------------------------+
-//|                                                  RiskManager.mqh |
-//|                          EA102 - XAUUSD Prop Firm EA             |
-//|   Lot sizing, exposure control, frequency gate (condition X + F) |
+//+------------------------------------------------------------------+
+//|                                                 RiskManager.mqh  |
+//|                        EA102 v2 - XAUUSD Prop Firm EA            |
+//|        Lot sizing, frequency gate, exposure control             |
 //+------------------------------------------------------------------+
 #ifndef RISKMANAGER_MQH
 #define RISKMANAGER_MQH
+
 #include "Utilities.mqh"
-#include "SignalEngine.mqh"
 
 //+------------------------------------------------------------------+
-//| CRiskManager class                                               |
+//| CRiskManager                                                     |
 //+------------------------------------------------------------------+
 class CRiskManager
   {
 private:
-   string            m_symbol;
-   int               m_magicNumber;
+   string          m_symbol;
+   int             m_magic;
+   double          m_riskPct;
+   double          m_maxExposurePct;
+   int             m_maxOpenTrades;
+   ENUM_TRADE_MODE m_tradeMode;
+   bool            m_allowHedge;
+   int             m_maxTradesPerDay;
+   int             m_maxTradesPerSess;
 
-   // Risk parameters
-   double            m_riskPctPerTrade;    // e.g. 1.0 = 1%
-   double            m_maxRiskExposurePct; // Total open risk % allowed
-   int               m_maxOpenTrades;
-   double            m_maxSymbolRiskPct;   // Per-symbol exposure limit
+   //--- Frequency tracking
+   datetime m_lastTradeTime;
+   datetime m_lastLossTime;
+   int      m_tradesToday;
+   int      m_tradesThisSess;
+   datetime m_lastDayReset;
+   datetime m_lastSessBarTime;
 
-   // Frequency control
-   ENUM_TRADE_MODE   m_tradeMode;
-   int               m_cooldownSecs;       // Cooldown after any trade (mode dependent)
-   int               m_cooldownAfterLoss;  // Extra cooldown on losing trade
-   int               m_maxTradesPerDay;
-   int               m_maxTradesPerSession;
+   //--- Per-mode cooldowns (seconds)
+   int GetCooldownSecs()     const { return (m_tradeMode == TRADE_MODE_SAFE) ? 3600 : (m_tradeMode == TRADE_MODE_NORMAL) ? 1800 : 600; }
+   int GetLossCooldownSecs() const { return (m_tradeMode == TRADE_MODE_SAFE) ? 7200 : (m_tradeMode == TRADE_MODE_NORMAL) ? 3600 : 1800; }
 
-   // State
-   datetime          m_lastTradeTime;
-   datetime          m_lastLossTime;
-   int               m_tradesToday;
-   int               m_tradesThisSession;
-   datetime          m_lastDayReset;
-   datetime          m_lastSessionReset;
-
-   // Hedge control
-   bool              m_allowHedge;
+   //--- Count open EA positions
+   int CountOpenPositions() const
+     {
+      int cnt = 0;
+      for(int i = 0; i < PositionsTotal(); i++)
+        {
+         ulong t = PositionGetTicket(i);
+         if(!PositionSelectByTicket(t)) continue;
+         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+         if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) continue;
+         cnt++;
+        }
+      return cnt;
+     }
 
 public:
    CRiskManager() : m_lastTradeTime(0), m_lastLossTime(0),
-                    m_tradesToday(0), m_tradesThisSession(0),
-                    m_lastDayReset(0), m_lastSessionReset(0) {}
-   ~CRiskManager() {}
+                    m_tradesToday(0), m_tradesThisSess(0),
+                    m_lastDayReset(0), m_lastSessBarTime(0) {}
 
-   bool Init(const string    symbol,
-             int             magicNumber,
-             double          riskPct,
-             double          maxExposurePct,
-             int             maxOpenTrades,
-             double          maxSymbolRiskPct,
-             ENUM_TRADE_MODE tradeMode,
-             bool            allowHedge,
-             int             maxTradesPerDay,
-             int             maxTradesPerSession)
+   bool Init(const string symbol, int magic, double riskPct,
+             double maxExposurePct, int maxOpenTrades, ENUM_TRADE_MODE tradeMode,
+             bool allowHedge, int maxTradesPerDay, int maxTradesPerSess)
      {
-      m_symbol              = symbol;
-      m_magicNumber         = magicNumber;
-      m_riskPctPerTrade     = riskPct;
-      m_maxRiskExposurePct  = maxExposurePct;
-      m_maxOpenTrades       = maxOpenTrades;
-      m_maxSymbolRiskPct    = maxSymbolRiskPct;
-      m_tradeMode           = tradeMode;
-      m_allowHedge          = allowHedge;
-      m_maxTradesPerDay     = maxTradesPerDay;
-      m_maxTradesPerSession = maxTradesPerSession;
-
-      UpdateCooldownFromMode();
-
-      LogInfo("RiskManager", StringFormat(
-         "Init | Risk=%.1f%% | MaxExposure=%.1f%% | MaxTrades=%d | Mode=%s | AllowHedge=%s",
-         riskPct, maxExposurePct, maxOpenTrades, EnumToString(tradeMode),
-         allowHedge ? "YES" : "NO"));
+      m_symbol          = symbol;
+      m_magic           = magic;
+      m_riskPct         = riskPct;
+      m_maxExposurePct  = maxExposurePct;
+      m_maxOpenTrades   = maxOpenTrades;
+      m_tradeMode       = tradeMode;
+      m_allowHedge      = allowHedge;
+      m_maxTradesPerDay  = maxTradesPerDay;
+      m_maxTradesPerSess = maxTradesPerSess;
+      m_lastDayReset    = GetDayStart();
+      LogInfo("RiskManager", StringFormat("Init | Risk=%.1f%% MaxExp=%.1f%% MaxOpen=%d Mode=%s",
+              riskPct, maxExposurePct, maxOpenTrades, EnumToString(tradeMode)));
       return true;
      }
 
-   //--- Update cooldown settings based on trade mode
-   void SetTradeMode(ENUM_TRADE_MODE mode)
+   void SetTradeMode(ENUM_TRADE_MODE mode) { m_tradeMode = mode; }
+
+   //--- Daily reset of counters
+   void UpdateDailyCounters()
      {
-      m_tradeMode = mode;
-      UpdateCooldownFromMode();
+      datetime today = GetDayStart();
+      if(today != m_lastDayReset)
+        {
+         m_tradesToday   = 0;
+         m_tradesThisSess = 0;
+         m_lastDayReset  = today;
+        }
      }
 
-   //--- Condition F: Frequency gate — can we place a new trade now?
-   bool IsFrequencyGateOpen(string &reason)
+   //+------------------------------------------------------------------+
+   //| N (Frequency) gate — condition F                                |
+   //+------------------------------------------------------------------+
+   bool IsFrequencyGateOpen(string &reason) const
      {
-      DailyReset();
-      SessionReset();
-
       datetime now = TimeCurrent();
 
-      // 1. Daily trade count limit
-      if(m_maxTradesPerDay > 0 && m_tradesToday >= m_maxTradesPerDay)
+      // Global cooldown since last trade
+      if(m_lastTradeTime > 0)
         {
-         reason = StringFormat("Max trades/day reached (%d/%d)", m_tradesToday, m_maxTradesPerDay);
-         return false;
-        }
-
-      // 2. Session trade count limit
-      if(m_maxTradesPerSession > 0 && m_tradesThisSession >= m_maxTradesPerSession)
-        {
-         reason = StringFormat("Max trades/session reached (%d/%d)", m_tradesThisSession, m_maxTradesPerSession);
-         return false;
-        }
-
-      // 3. General cooldown after last trade
-      if(m_lastTradeTime > 0 && (now - m_lastTradeTime) < m_cooldownSecs)
-        {
-         reason = StringFormat("Cooldown active (%ds remaining)",
-                               m_cooldownSecs - (int)(now - m_lastTradeTime));
-         return false;
-        }
-
-      // 4. Extra cooldown after a loss
-      if(m_lastLossTime > 0 && (now - m_lastLossTime) < m_cooldownAfterLoss)
-        {
-         reason = StringFormat("Loss cooldown active (%ds remaining)",
-                               m_cooldownAfterLoss - (int)(now - m_lastLossTime));
-         return false;
-        }
-
-      reason = "OK";
-      return true;
-     }
-
-   //--- Condition X: Exposure gate — is opening a new trade safe?
-   bool IsExposureAllowed(ENUM_SIGNAL_DIR newDir, double slDistance, string &reason)
-     {
-      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      if(balance <= 0)
-        {
-         reason = "Balance=0";
-         return false;
-        }
-
-      // 1. Max open trades
-      int openTrades = CountOpenTrades();
-      if(openTrades >= m_maxOpenTrades)
-        {
-         reason = StringFormat("Max open trades (%d/%d)", openTrades, m_maxOpenTrades);
-         return false;
-        }
-
-      // 2. Total open risk
-      double totalRisk = CalculateTotalOpenRiskPct();
-      if(totalRisk + m_riskPctPerTrade > m_maxRiskExposurePct)
-        {
-         reason = StringFormat("Total exposure too high (%.1f%% + %.1f%% > %.1f%%)",
-                               totalRisk, m_riskPctPerTrade, m_maxRiskExposurePct);
-         return false;
-        }
-
-      // 3. Hedge check
-      if(!m_allowHedge)
-        {
-         bool hasBuy  = HasOpenTrade(POSITION_TYPE_BUY);
-         bool hasSell = HasOpenTrade(POSITION_TYPE_SELL);
-         if((newDir == SIGNAL_BUY && hasSell) || (newDir == SIGNAL_SELL && hasBuy))
+         long elapsed = (long)now - (long)m_lastTradeTime;
+         if(elapsed < GetCooldownSecs())
            {
-            reason = "Hedge not allowed";
+            reason = StringFormat("Cooldown %ds remaining", GetCooldownSecs() - (int)elapsed);
             return false;
            }
         }
 
-      reason = "OK";
+      // Loss cooldown
+      if(m_lastLossTime > 0)
+        {
+         long elapsed = (long)now - (long)m_lastLossTime;
+         if(elapsed < GetLossCooldownSecs())
+           {
+            reason = StringFormat("Loss-cooldown %ds remaining", GetLossCooldownSecs() - (int)elapsed);
+            return false;
+           }
+        }
+
+      // Daily limit
+      if(m_maxTradesPerDay > 0 && m_tradesToday >= m_maxTradesPerDay)
+        {
+         reason = StringFormat("Daily limit %d reached", m_maxTradesPerDay);
+         return false;
+        }
+
+      // Session limit
+      if(m_maxTradesPerSess > 0 && m_tradesThisSess >= m_maxTradesPerSess)
+        {
+         reason = StringFormat("Session limit %d reached", m_maxTradesPerSess);
+         return false;
+        }
+
+      reason = "";
       return true;
      }
 
-   //--- Calculate risk-based lot size
-   double CalculateLotSize(double entryPrice, double stopLossPrice)
+   //+------------------------------------------------------------------+
+   //| X (Exposure) gate — condition X                                 |
+   //+------------------------------------------------------------------+
+   bool IsExposureAllowed(ENUM_SIGNAL_DIR dir, double slDistancePrice, string &reason) const
      {
-      double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
-      double riskAmt  = balance * m_riskPctPerTrade / 100.0;
-      double slDist   = MathAbs(entryPrice - stopLossPrice);
-
-      if(slDist <= 0)
+      // Max simultaneous open trades
+      int open = CountOpenPositions();
+      if(open >= m_maxOpenTrades)
         {
-         LogError("RiskManager", "SL distance=0, cannot calculate lot size");
-         return SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
+         reason = StringFormat("Max open trades %d reached", m_maxOpenTrades);
+         return false;
         }
 
-      // pip value per lot
-      double tickVal  = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tickSize = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
-      double pvPerLot = (tickVal / tickSize) * slDist;
-
-      if(pvPerLot <= 0)
+      // Hedge rule
+      if(!m_allowHedge && open > 0)
         {
-         LogError("RiskManager", "Pip value calc failed");
-         return SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
+         for(int i = 0; i < PositionsTotal(); i++)
+           {
+            ulong t = PositionGetTicket(i);
+            if(!PositionSelectByTicket(t)) continue;
+            if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+            if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) continue;
+            int posType = (int)PositionGetInteger(POSITION_TYPE);
+            bool existingBuy  = (posType == POSITION_TYPE_BUY);
+            bool existingSell = (posType == POSITION_TYPE_SELL);
+            if((dir == SIGNAL_BUY  && existingSell) ||
+               (dir == SIGNAL_SELL && existingBuy))
+              {
+               reason = "Hedge not allowed";
+               return false;
+              }
+           }
         }
 
-      double lots = riskAmt / pvPerLot;
-      lots = NormalizeLots(m_symbol, lots);
+      // Total exposure check
+      if(slDistancePrice > 0 && m_maxExposurePct > 0)
+        {
+         double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+         double newRisk   = balance * m_riskPct / 100.0;
+         double currRisk  = 0;
+         for(int i = 0; i < PositionsTotal(); i++)
+           {
+            ulong t = PositionGetTicket(i);
+            if(!PositionSelectByTicket(t)) continue;
+            if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
+            if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) continue;
+            double pnl = PositionGetDouble(POSITION_PROFIT);
+            if(pnl < 0) currRisk += MathAbs(pnl);
+           }
+         double totalRisk    = currRisk + newRisk;
+         double totalRiskPct = (balance > 0) ? totalRisk / balance * 100.0 : 0;
+         if(totalRiskPct > m_maxExposurePct)
+           {
+            reason = StringFormat("Exposure %.1f%% > max %.1f%%", totalRiskPct, m_maxExposurePct);
+            return false;
+           }
+        }
 
-      LogDebug("RiskManager", StringFormat(
-         "LotCalc | Bal=%.2f Risk%%=%.2f RiskAmt=%.2f SLDist=%.5f PV/lot=%.4f Lots=%.2f",
-         balance, m_riskPctPerTrade, riskAmt, slDist, pvPerLot, lots));
-
-      return lots;
+      reason = "";
+      return true;
      }
 
-   //--- Record trade opened
+   //+------------------------------------------------------------------+
+   //| Lot sizing based on account risk and SL distance               |
+   //+------------------------------------------------------------------+
+   double CalculateLotSize(double entryPrice, double stopLoss) const
+     {
+      double slDist = MathAbs(entryPrice - stopLoss);
+      if(slDist <= 0) return SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
+
+      double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+      double riskMoney  = balance * m_riskPct / 100.0;
+      double tickVal    = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize   = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(tickVal <= 0 || tickSize <= 0) return SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
+
+      double valPerPoint = (tickVal / tickSize) * SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+      double lossPerLot  = (slDist / SymbolInfoDouble(m_symbol, SYMBOL_POINT)) * valPerPoint;
+      if(lossPerLot <= 0) return SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
+
+      double lots = riskMoney / lossPerLot;
+      return NormalizeLots(m_symbol, lots);
+     }
+
+   //--- Called after a new trade is opened
    void OnTradeOpened()
      {
       m_lastTradeTime = TimeCurrent();
       m_tradesToday++;
-      m_tradesThisSession++;
-      LogDebug("RiskManager", StringFormat(
-         "Trade opened | Today=%d Session=%d", m_tradesToday, m_tradesThisSession));
+      m_tradesThisSess++;
      }
 
-   //--- Record trade closed as loss
+   //--- Called when a trade closes in loss (from OnTradeTransaction)
    void OnTradeLoss()
      {
       m_lastLossTime = TimeCurrent();
-      LogDebug("RiskManager", "Loss cooldown started");
+      LogInfo("RiskManager", "Loss recorded — cooldown started");
      }
 
    //--- Getters
-   ENUM_TRADE_MODE GetTradeMode()       const { return m_tradeMode; }
-   int             GetTradesPerDay()    const { return m_tradesToday; }
-   int             GetOpenTradeCount()  const { return CountOpenTrades(); }
-   double          GetTotalRiskPct()    const { return CalculateTotalOpenRiskPct(); }
-   double          GetRiskPctPerTrade() const { return m_riskPctPerTrade; }
-
-private:
-   void UpdateCooldownFromMode()
-     {
-      switch(m_tradeMode)
-        {
-         case TRADE_MODE_SAFE:
-            m_cooldownSecs     = 3600;  // 60 min
-            m_cooldownAfterLoss = 7200; // 2 hours
-            break;
-         case TRADE_MODE_NORMAL:
-            m_cooldownSecs     = 1800;  // 30 min
-            m_cooldownAfterLoss = 3600; // 1 hour
-            break;
-         case TRADE_MODE_AGGRESSIVE:
-            m_cooldownSecs     = 600;   // 10 min
-            m_cooldownAfterLoss = 1800; // 30 min
-            break;
-        }
-     }
-
-   int CountOpenTrades() const
-     {
-      int count = 0;
-      for(int i = 0; i < PositionsTotal(); i++)
-        {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket == 0) continue;
-         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if((int)PositionGetInteger(POSITION_MAGIC) != m_magicNumber) continue;
-         count++;
-        }
-      return count;
-     }
-
-   bool HasOpenTrade(ENUM_POSITION_TYPE type) const
-     {
-      for(int i = 0; i < PositionsTotal(); i++)
-        {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket == 0) continue;
-         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if((int)PositionGetInteger(POSITION_MAGIC) != m_magicNumber) continue;
-         if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == type) return true;
-        }
-      return false;
-     }
-
-   double CalculateTotalOpenRiskPct() const
-     {
-      double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
-      if(balance <= 0) return 0;
-
-      double totalRisk = 0;
-      for(int i = 0; i < PositionsTotal(); i++)
-        {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket == 0) continue;
-         if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if((int)PositionGetInteger(POSITION_MAGIC) != m_magicNumber) continue;
-
-         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-         double sl        = PositionGetDouble(POSITION_SL);
-         double lots      = PositionGetDouble(POSITION_VOLUME);
-         ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
-         if(sl == 0) continue;
-
-         double slDist = MathAbs(openPrice - sl);
-         double tickVal  = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_VALUE);
-         double tickSize = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
-         double pvPerLot = (tickVal / tickSize) * slDist;
-
-         totalRisk += pvPerLot * lots;
-        }
-
-      return totalRisk / balance * 100.0;
-     }
-
-   void DailyReset()
-     {
-      datetime now = TimeCurrent();
-      if(!SameDay(now, m_lastDayReset))
-        {
-         m_tradesToday    = 0;
-         m_lastDayReset   = now;
-        }
-     }
-
-   void SessionReset()
-     {
-      // Reset session counter every 8 hours
-      datetime now = TimeCurrent();
-      if(m_lastSessionReset == 0 || (now - m_lastSessionReset) > 8 * 3600)
-        {
-         m_tradesThisSession = 0;
-         m_lastSessionReset  = now;
-        }
-     }
+   ENUM_TRADE_MODE GetTradeMode()      const { return m_tradeMode;      }
+   int             GetOpenTradeCount() const { return CountOpenPositions(); }
+   int             GetTradesPerDay()   const { return m_tradesToday;     }
+   int             GetTradesPerSess()  const { return m_tradesThisSess;  }
+   double          GetRiskPct()        const { return m_riskPct;         }
   };
-//+------------------------------------------------------------------+
+
 #endif // RISKMANAGER_MQH

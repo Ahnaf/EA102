@@ -1,523 +1,389 @@
-﻿//+------------------------------------------------------------------+
-//|                                               MarketStructure.mqh|
-//|                          EA102 - XAUUSD Prop Firm EA             |
-//|    BOS / CHOCH / Liquidity Sweep / Order Blocks / FVG Detection  |
+//+------------------------------------------------------------------+
+//|                                             MarketStructure.mqh  |
+//|                        EA102 v2 - XAUUSD Prop Firm EA            |
+//| SMC Engine: BOS, CHOCH, Liquidity Sweep, Order Blocks, FVGs     |
 //+------------------------------------------------------------------+
 #ifndef MARKETSTRUCTURE_MQH
 #define MARKETSTRUCTURE_MQH
+
 #include "Utilities.mqh"
 
-//--- Structure type
-enum ENUM_MS_SIGNAL
-  {
-   MS_NONE        = 0,
-   MS_BOS_BULL    = 1,   // Bullish Break of Structure
-   MS_BOS_BEAR    = 2,   // Bearish Break of Structure
-   MS_CHOCH_BULL  = 3,   // Bullish Change of Character
-   MS_CHOCH_BEAR  = 4,   // Bearish Change of Character
-   MS_LIQ_SWEEP_H = 5,   // Liquidity Sweep of swing high
-   MS_LIQ_SWEEP_L = 6,   // Liquidity Sweep of swing low
-  };
+#define MAX_OBS  10
+#define MAX_FVGS 10
 
-//--- Order Block structure
-struct OrderBlock
+//--- Order Block zone
+struct OBZone
   {
    double   high;
    double   low;
-   bool     isBullish;   // Bullish OB = bearish candle before bullish move
-   datetime time;
+   bool     bullish;     // bullish OB = support, bearish OB = resistance
    bool     active;
+   datetime time;
   };
 
-//--- Fair Value Gap structure
-struct FVG
+//--- Fair Value Gap zone (3-candle imbalance)
+struct FVGZone
   {
-   double   upper;
-   double   lower;
-   bool     isBullish;
-   datetime time;
+   double   high;         // Top of gap
+   double   low;          // Bottom of gap
+   bool     bullish;      // Bullish FVG = price should retrace down to fill
    bool     active;
+   datetime time;
   };
 
 //+------------------------------------------------------------------+
-//| CMarketStructure class                                           |
+//| CMarketStructure — per timeframe                                 |
 //+------------------------------------------------------------------+
 class CMarketStructure
   {
 private:
-   string            m_symbol;
-   ENUM_TIMEFRAMES   m_tf;
-   int               m_lookback;       // Bars to look back for structure
-   int               m_swingStrength;  // Min bars on each side for swing
+   string           m_symbol;
+   ENUM_TIMEFRAMES  m_tf;
+   int              m_lookback;     // Bars to analyse
+   int              m_swingStr;     // Bars each side for pivot
 
-   // Current structure state
-   double            m_lastSwingHigh;
-   double            m_lastSwingLow;
-   double            m_prevSwingHigh;
-   double            m_prevSwingLow;
-   datetime          m_lastSwingHighTime;
-   datetime          m_lastSwingLowTime;
+   //--- Swing tracking
+   double   m_lastSwingHigh;
+   double   m_lastSwingLow;
+   double   m_prevSwingHigh;
+   double   m_prevSwingLow;
 
-   // Detected signals
-   ENUM_MS_SIGNAL    m_lastSignal;
-   datetime          m_lastSignalTime;
+   //--- Structure state
+   bool     m_buStrucValid;    // Bullish structure (HH + HL)
+   bool     m_beStrucValid;    // Bearish structure (LL + LH)
+   bool     m_lastBOSBull;     // Last BOS was bullish?
+   bool     m_lastBOSBear;
+   bool     m_lastCHOCHBull;   // Change of character upward?
+   bool     m_lastCHOCHBear;
 
-   // Order blocks (store up to 5)
-   OrderBlock        m_orderBlocks[5];
-   int               m_obCount;
+   //--- Liquidity sweep flags (set on Update, valid for one bar)
+   bool     m_liqSweepBull;    // Swept a low then reversed up
+   bool     m_liqSweepBear;    // Swept a high then reversed down
 
-   // FVGs (store up to 5)
-   FVG               m_fvgs[5];
-   int               m_fvgCount;
+   //--- Order Blocks
+   OBZone   m_obs[MAX_OBS];
+   int      m_obCount;
 
-public:
-   CMarketStructure() : m_lastSignal(MS_NONE), m_obCount(0), m_fvgCount(0) {}
-   ~CMarketStructure() {}
+   //--- FVGs
+   FVGZone  m_fvgs[MAX_FVGS];
+   int      m_fvgCount;
 
-   bool Init(const string symbol, ENUM_TIMEFRAMES tf, int lookback = 100, int swingStrength = 3)
+   //--- Helpers
+   bool IsSwingHigh(int idx) const
      {
-      m_symbol       = symbol;
-      m_tf           = tf;
-      m_lookback     = lookback;
-      m_swingStrength = swingStrength;
-      m_lastSwingHigh = 0;
-      m_lastSwingLow  = DBL_MAX;
-      m_prevSwingHigh = 0;
-      m_prevSwingLow  = DBL_MAX;
-      m_lastSignalTime= 0;
-
-      LogInfo("MarketStructure", StringFormat(
-         "Init | %s %s | Lookback=%d | SwingStr=%d",
-         symbol, EnumToString(tf), lookback, swingStrength));
+      for(int k = 1; k <= m_swingStr; k++)
+        {
+         if(iHigh(m_symbol, m_tf, idx) <= iHigh(m_symbol, m_tf, idx + k)) return false;
+         if(iHigh(m_symbol, m_tf, idx) <= iHigh(m_symbol, m_tf, idx - k)) return false;
+        }
       return true;
      }
 
-   //--- Master update — call once per bar
+   bool IsSwingLow(int idx) const
+     {
+      for(int k = 1; k <= m_swingStr; k++)
+        {
+         if(iLow(m_symbol, m_tf, idx) >= iLow(m_symbol, m_tf, idx + k)) return false;
+         if(iLow(m_symbol, m_tf, idx) >= iLow(m_symbol, m_tf, idx - k)) return false;
+        }
+      return true;
+     }
+
+   void AddOB(double high, double low, bool bullish)
+     {
+      if(m_obCount >= MAX_OBS)
+        {
+         // Shift array left (drop oldest)
+         for(int i = 0; i < MAX_OBS - 1; i++) m_obs[i] = m_obs[i + 1];
+         m_obCount = MAX_OBS - 1;
+        }
+      m_obs[m_obCount].high    = high;
+      m_obs[m_obCount].low     = low;
+      m_obs[m_obCount].bullish = bullish;
+      m_obs[m_obCount].active  = true;
+      m_obs[m_obCount].time    = iTime(m_symbol, m_tf, 0);
+      m_obCount++;
+     }
+
+   void AddFVG(double high, double low, bool bullish)
+     {
+      if(m_fvgCount >= MAX_FVGS)
+        {
+         for(int i = 0; i < MAX_FVGS - 1; i++) m_fvgs[i] = m_fvgs[i + 1];
+         m_fvgCount = MAX_FVGS - 1;
+        }
+      m_fvgs[m_fvgCount].high    = high;
+      m_fvgs[m_fvgCount].low     = low;
+      m_fvgs[m_fvgCount].bullish = bullish;
+      m_fvgs[m_fvgCount].active  = true;
+      m_fvgs[m_fvgCount].time    = iTime(m_symbol, m_tf, 0);
+      m_fvgCount++;
+     }
+
+public:
+   CMarketStructure() : m_lastSwingHigh(0), m_lastSwingLow(0),
+                        m_prevSwingHigh(0), m_prevSwingLow(0),
+                        m_buStrucValid(false), m_beStrucValid(false),
+                        m_lastBOSBull(false), m_lastBOSBear(false),
+                        m_lastCHOCHBull(false), m_lastCHOCHBear(false),
+                        m_liqSweepBull(false), m_liqSweepBear(false),
+                        m_obCount(0), m_fvgCount(0) {}
+
+   bool Init(const string symbol, ENUM_TIMEFRAMES tf, int lookback, int swingStr)
+     {
+      m_symbol   = symbol;
+      m_tf       = tf;
+      m_lookback = lookback;
+      m_swingStr = MathMax(1, swingStr);
+      LogInfo("MarketStructure", StringFormat("Init | TF=%s Lookback=%d SwingStr=%d",
+              EnumToString(tf), lookback, swingStr));
+      Update();   // Initial scan
+      return true;
+     }
+
+   //+------------------------------------------------------------------+
+   //| Main update — call on each new bar                              |
+   //+------------------------------------------------------------------+
    void Update()
      {
-      DetectSwings();
-      DetectBOSandCHOCH();
-      DetectLiquiditySweep();
-      DetectOrderBlocks();
-      DetectFVG();
-     }
+      // Reset per-bar flags
+      m_lastBOSBull   = false;
+      m_lastBOSBear   = false;
+      m_lastCHOCHBull = false;
+      m_lastCHOCHBear = false;
+      m_liqSweepBull  = false;
+      m_liqSweepBear  = false;
 
-   //--- === SWING DETECTION ===
-   void DetectSwings()
-     {
-      int bars = MathMin(m_lookback, iBars(m_symbol, m_tf) - m_swingStrength - 1);
+      // Collect swing highs and lows
+      double swingHighs[]; double swingHighTimes[];
+      double swingLows[];  double swingLowTimes[];
+      int    shCount = 0,  slCount = 0;
+      ArrayResize(swingHighs, m_lookback);
+      ArrayResize(swingLows,  m_lookback);
 
-      for(int i = m_swingStrength + 1; i < bars; i++)
+      int end = m_lookback + m_swingStr;
+      for(int i = m_swingStr; i <= end; i++)
         {
-         // Check swing high: bar[i] is higher than m_swingStrength bars on each side
-         double hi = iHigh(m_symbol, m_tf, i);
-         bool   isSwingHigh = true;
-         bool   isSwingLow  = true;
-
-         for(int j = 1; j <= m_swingStrength; j++)
+         if(IsSwingHigh(i))
            {
-            if(iHigh(m_symbol, m_tf, i - j) >= hi) { isSwingHigh = false; break; }
+            if(shCount < m_lookback) { swingHighs[shCount] = iHigh(m_symbol, m_tf, i); shCount++; }
            }
-         if(isSwingHigh)
+         if(IsSwingLow(i))
            {
-            for(int j = 1; j <= m_swingStrength; j++)
+            if(slCount < m_lookback) { swingLows[slCount] = iLow(m_symbol, m_tf, i); slCount++; }
+           }
+        }
+
+      // Update tracked swings (most recent first — index 0 = newest)
+      if(shCount >= 2)
+        {
+         m_prevSwingHigh = (m_lastSwingHigh > 0) ? m_lastSwingHigh : swingHighs[1];
+         m_lastSwingHigh = swingHighs[0];
+        }
+      else if(shCount == 1)
+        {
+         m_prevSwingHigh = m_lastSwingHigh;
+         m_lastSwingHigh = swingHighs[0];
+        }
+
+      if(slCount >= 2)
+        {
+         m_prevSwingLow = (m_lastSwingLow > 0) ? m_lastSwingLow : swingLows[1];
+         m_lastSwingLow = swingLows[0];
+        }
+      else if(slCount == 1)
+        {
+         m_prevSwingLow = m_lastSwingLow;
+         m_lastSwingLow = swingLows[0];
+        }
+
+      double close0 = iClose(m_symbol, m_tf, 1);  // Last closed bar
+      double high0  = iHigh (m_symbol, m_tf, 1);
+      double low0   = iLow  (m_symbol, m_tf, 1);
+
+      // BOS (Break of Structure) — continuation breaks
+      if(m_prevSwingHigh > 0 && close0 > m_prevSwingHigh)
+        {
+         m_lastBOSBull  = true;
+         m_buStrucValid = true;
+         m_beStrucValid = false;
+         // Mark the last bearish candle before breakout as Bearish OB (resistance-turned-support)
+         for(int i = 2; i <= 6; i++)
+           {
+            if(iClose(m_symbol, m_tf, i) < iOpen(m_symbol, m_tf, i))
               {
-               if(iHigh(m_symbol, m_tf, i + j) >= hi) { isSwingHigh = false; break; }
+               AddOB(iHigh(m_symbol, m_tf, i), iLow(m_symbol, m_tf, i), true);
+               break;
               }
            }
+        }
 
-         double lo = iLow(m_symbol, m_tf, i);
-         for(int j = 1; j <= m_swingStrength; j++)
+      if(m_prevSwingLow > 0 && close0 < m_prevSwingLow)
+        {
+         m_lastBOSBear  = true;
+         m_beStrucValid = true;
+         m_buStrucValid = false;
+         // Mark last bullish candle before breakdown as Bullish OB (support-turned-resistance)
+         for(int i = 2; i <= 6; i++)
            {
-            if(iLow(m_symbol, m_tf, i - j) <= lo) { isSwingLow = false; break; }
-           }
-         if(isSwingLow)
-           {
-            for(int j = 1; j <= m_swingStrength; j++)
+            if(iClose(m_symbol, m_tf, i) > iOpen(m_symbol, m_tf, i))
               {
-               if(iLow(m_symbol, m_tf, i + j) <= lo) { isSwingLow = false; break; }
-              }
-           }
-
-         if(isSwingHigh)
-           {
-            datetime t = iTime(m_symbol, m_tf, i);
-            if(t != m_lastSwingHighTime)
-              {
-               m_prevSwingHigh     = m_lastSwingHigh;
-               m_lastSwingHigh     = hi;
-               m_lastSwingHighTime = t;
-              }
-           }
-
-         if(isSwingLow)
-           {
-            datetime t = iTime(m_symbol, m_tf, i);
-            if(t != m_lastSwingLowTime)
-              {
-               m_prevSwingLow     = m_lastSwingLow;
-               m_lastSwingLow     = lo;
-               m_lastSwingLowTime = t;
+               AddOB(iHigh(m_symbol, m_tf, i), iLow(m_symbol, m_tf, i), false);
+               break;
               }
            }
         }
-     }
 
-   //--- === BOS / CHOCH DETECTION ===
-   void DetectBOSandCHOCH()
-     {
-      double closeNow  = iClose(m_symbol, m_tf, 1);
-      datetime tNow    = iTime(m_symbol, m_tf, 1);
-
-      if(tNow == m_lastSignalTime) return;
-
-      // Bullish BOS: price closes above last swing high (continuation of uptrend)
-      if(m_lastSwingHigh > 0 && closeNow > m_lastSwingHigh && m_prevSwingHigh > 0)
+      // CHOCH — change of character (break AGAINST current trend)
+      if(m_beStrucValid && m_prevSwingHigh > 0 && close0 > m_prevSwingHigh)
         {
-         // If we were in a downtrend (LH), this is a CHOCH; otherwise BOS
-         bool wasBearish = (m_lastSwingHigh < m_prevSwingHigh);
-         m_lastSignal     = wasBearish ? MS_CHOCH_BULL : MS_BOS_BULL;
-         m_lastSignalTime = tNow;
-         LogDebug("MarketStructure", StringFormat(
-            "%s detected | Price=%.5f | SwingHigh=%.5f",
-            m_lastSignal == MS_CHOCH_BULL ? "CHOCH_BULL" : "BOS_BULL",
-            closeNow, m_lastSwingHigh));
-         return;
+         m_lastCHOCHBull = true;   // Was bearish, now breaks up
+        }
+      if(m_buStrucValid && m_prevSwingLow > 0 && close0 < m_prevSwingLow)
+        {
+         m_lastCHOCHBear = true;   // Was bullish, now breaks down
         }
 
-      // Bearish BOS: price closes below last swing low (continuation of downtrend)
-      if(m_lastSwingLow < DBL_MAX && closeNow < m_lastSwingLow && m_prevSwingLow < DBL_MAX)
+      // --- LIQUIDITY SWEEP DETECTION ---
+      // Bull sweep: bar swept below a recent swing low AND closed back above it → reversal up
+      if(m_lastSwingLow > 0 && low0 < m_lastSwingLow && close0 > m_lastSwingLow)
         {
-         bool wasBullish = (m_lastSwingLow > m_prevSwingLow);
-         m_lastSignal     = wasBullish ? MS_CHOCH_BEAR : MS_BOS_BEAR;
-         m_lastSignalTime = tNow;
-         LogDebug("MarketStructure", StringFormat(
-            "%s detected | Price=%.5f | SwingLow=%.5f",
-            m_lastSignal == MS_CHOCH_BEAR ? "CHOCH_BEAR" : "BOS_BEAR",
-            closeNow, m_lastSwingLow));
-         return;
+         // Additional quality filter: the sweep candle must be bullish (close > open)
+         if(IsBullishCandle(m_symbol, m_tf, 1))
+            m_liqSweepBull = true;
+        }
+      // Also check bar[2] swept and bar[1] confirmed reversal
+      if(!m_liqSweepBull && m_lastSwingLow > 0)
+        {
+         double low2 = iLow(m_symbol, m_tf, 2);
+         if(low2 < m_lastSwingLow && close0 > m_lastSwingLow && IsBullishCandle(m_symbol, m_tf, 1))
+            m_liqSweepBull = true;
         }
 
-      m_lastSignal = MS_NONE;
-     }
-
-   //--- === LIQUIDITY SWEEP DETECTION ===
-   void DetectLiquiditySweep()
-     {
-      // A sweep: price wicks past a swing level but closes back inside
-      double hi    = iHigh(m_symbol,  m_tf, 1);
-      double lo    = iLow(m_symbol,   m_tf, 1);
-      double close = iClose(m_symbol, m_tf, 1);
-
-      // Sweep of swing high (hunt stops above, then close back below)
-      if(m_lastSwingHigh > 0 && hi > m_lastSwingHigh && close < m_lastSwingHigh)
+      // Bear sweep: bar swept above a recent swing high AND closed back below it → reversal down
+      if(m_lastSwingHigh > 0 && high0 > m_lastSwingHigh && close0 < m_lastSwingHigh)
         {
-         m_lastSignal     = MS_LIQ_SWEEP_H;
-         m_lastSignalTime = iTime(m_symbol, m_tf, 1);
-         LogDebug("MarketStructure", StringFormat(
-            "LIQ_SWEEP_H | Hi=%.5f > SwingH=%.5f | Close=%.5f",
-            hi, m_lastSwingHigh, close));
-         return;
+         if(IsBearishCandle(m_symbol, m_tf, 1))
+            m_liqSweepBear = true;
+        }
+      if(!m_liqSweepBear && m_lastSwingHigh > 0)
+        {
+         double high2 = iHigh(m_symbol, m_tf, 2);
+         if(high2 > m_lastSwingHigh && close0 < m_lastSwingHigh && IsBearishCandle(m_symbol, m_tf, 1))
+            m_liqSweepBear = true;
         }
 
-      // Sweep of swing low
-      if(m_lastSwingLow < DBL_MAX && lo < m_lastSwingLow && close > m_lastSwingLow)
-        {
-         m_lastSignal     = MS_LIQ_SWEEP_L;
-         m_lastSignalTime = iTime(m_symbol, m_tf, 1);
-         LogDebug("MarketStructure", StringFormat(
-            "LIQ_SWEEP_L | Lo=%.5f < SwingL=%.5f | Close=%.5f",
-            lo, m_lastSwingLow, close));
-         return;
-        }
+      // --- FVG DETECTION --- (3-candle imbalance pattern)
+      // Bullish FVG: bar[3].high < bar[1].low  (gap between candle 3 and candle 1)
+      if(iHigh(m_symbol, m_tf, 3) < iLow(m_symbol, m_tf, 1))
+        AddFVG(iLow(m_symbol, m_tf, 1), iHigh(m_symbol, m_tf, 3), true);
+
+      // Bearish FVG: bar[3].low > bar[1].high
+      if(iLow(m_symbol, m_tf, 3) > iHigh(m_symbol, m_tf, 1))
+        AddFVG(iHigh(m_symbol, m_tf, 1), iLow(m_symbol, m_tf, 3), false);
      }
 
-   //--- === ORDER BLOCK DETECTION ===
-   //--- OB = last bearish candle before a bullish impulse (bullish OB)
-   //---      last bullish candle before a bearish impulse (bearish OB)
-   void DetectOrderBlocks()
-     {
-      if(m_obCount >= 5) return;
-
-      // Look at bar[2]: if bar[1] is a strong impulse and bar[2] is opposite
-      bool bar1Bull = IsBullishCandle(m_symbol, m_tf, 1);
-      bool bar2Bull = IsBullishCandle(m_symbol, m_tf, 2);
-
-      double bar1Body = MathAbs(iClose(m_symbol, m_tf, 1) - iOpen(m_symbol, m_tf, 1));
-      double bar2Body = MathAbs(iClose(m_symbol, m_tf, 2) - iOpen(m_symbol, m_tf, 2));
-
-      double atr = GetATR(m_symbol, m_tf, 14, 1);
-      if(atr == 0) return;
-
-      // Strong impulse = body > 0.5 * ATR
-      bool bar1Strong = (bar1Body > atr * 0.5);
-
-      if(bar1Strong && bar1Bull && !bar2Bull)
-        {
-         // Bearish bar[2] before bullish impulse = Bullish OB
-         OrderBlock ob;
-         ob.high      = iHigh(m_symbol, m_tf, 2);
-         ob.low       = iLow(m_symbol, m_tf, 2);
-         ob.isBullish = true;
-         ob.time      = iTime(m_symbol, m_tf, 2);
-         ob.active    = true;
-
-         // Check not duplicate
-         bool dup = false;
-         for(int i = 0; i < m_obCount; i++)
-            if(MathAbs(m_orderBlocks[i].high - ob.high) < SymbolInfoDouble(m_symbol, SYMBOL_POINT) * 10)
-              { dup = true; break; }
-
-         if(!dup)
-           {
-            m_orderBlocks[m_obCount++] = ob;
-            LogDebug("MarketStructure", StringFormat(
-               "Bullish OB: %.5f-%.5f", ob.low, ob.high));
-           }
-        }
-
-      if(bar1Strong && !bar1Bull && bar2Bull)
-        {
-         // Bullish bar[2] before bearish impulse = Bearish OB
-         OrderBlock ob;
-         ob.high      = iHigh(m_symbol, m_tf, 2);
-         ob.low       = iLow(m_symbol, m_tf, 2);
-         ob.isBullish = false;
-         ob.time      = iTime(m_symbol, m_tf, 2);
-         ob.active    = true;
-
-         bool dup = false;
-         for(int i = 0; i < m_obCount; i++)
-            if(MathAbs(m_orderBlocks[i].high - ob.high) < SymbolInfoDouble(m_symbol, SYMBOL_POINT) * 10)
-              { dup = true; break; }
-
-         if(!dup)
-           {
-            m_orderBlocks[m_obCount++] = ob;
-            LogDebug("MarketStructure", StringFormat(
-               "Bearish OB: %.5f-%.5f", ob.low, ob.high));
-           }
-        }
-     }
-
-   //--- === FVG DETECTION ===
-   //--- FVG (3-candle pattern): gap between bar[3].high and bar[1].low (bull)
-   //---                         gap between bar[3].low and bar[1].high (bear)
-   void DetectFVG()
-     {
-      if(m_fvgCount >= 5) return;
-
-      double hi1 = iHigh(m_symbol, m_tf, 1);
-      double lo1 = iLow(m_symbol,  m_tf, 1);
-      double hi3 = iHigh(m_symbol, m_tf, 3);
-      double lo3 = iLow(m_symbol,  m_tf, 3);
-
-      // Bullish FVG: lo of bar1 > hi of bar3
-      if(lo1 > hi3)
-        {
-         FVG fvg;
-         fvg.upper     = lo1;
-         fvg.lower     = hi3;
-         fvg.isBullish = true;
-         fvg.time      = iTime(m_symbol, m_tf, 2);
-         fvg.active    = true;
-
-         bool dup = false;
-         for(int i = 0; i < m_fvgCount; i++)
-            if(MathAbs(m_fvgs[i].upper - fvg.upper) < SymbolInfoDouble(m_symbol, SYMBOL_POINT) * 10)
-              { dup = true; break; }
-
-         if(!dup)
-           {
-            m_fvgs[m_fvgCount++] = fvg;
-            LogDebug("MarketStructure", StringFormat(
-               "Bullish FVG: %.5f-%.5f", fvg.lower, fvg.upper));
-           }
-        }
-
-      // Bearish FVG: hi of bar1 < lo of bar3
-      if(hi1 < lo3)
-        {
-         FVG fvg;
-         fvg.upper     = lo3;
-         fvg.lower     = hi1;
-         fvg.isBullish = false;
-         fvg.time      = iTime(m_symbol, m_tf, 2);
-         fvg.active    = true;
-
-         bool dup = false;
-         for(int i = 0; i < m_fvgCount; i++)
-            if(MathAbs(m_fvgs[i].upper - fvg.upper) < SymbolInfoDouble(m_symbol, SYMBOL_POINT) * 10)
-              { dup = true; break; }
-
-         if(!dup)
-           {
-            m_fvgs[m_fvgCount++] = fvg;
-            LogDebug("MarketStructure", StringFormat(
-               "Bearish FVG: %.5f-%.5f", fvg.lower, fvg.upper));
-           }
-        }
-     }
-
-   //--- === PUBLIC QUERIES ===
-
-   ENUM_MS_SIGNAL GetLastSignal()     const { return m_lastSignal; }
-   datetime       GetLastSignalTime() const { return m_lastSignalTime; }
-   double         GetLastSwingHigh()  const { return m_lastSwingHigh; }
-   double         GetLastSwingLow()   const { return m_lastSwingLow; }
-
-   //--- Is price inside any bullish OB?
-   bool IsPriceInBullishOB(double price) const
-     {
-      for(int i = 0; i < m_obCount; i++)
-         if(m_orderBlocks[i].active && m_orderBlocks[i].isBullish)
-            if(price >= m_orderBlocks[i].low && price <= m_orderBlocks[i].high)
-               return true;
-      return false;
-     }
-
-   //--- Is price inside any bearish OB?
-   bool IsPriceInBearishOB(double price) const
-     {
-      for(int i = 0; i < m_obCount; i++)
-         if(m_orderBlocks[i].active && !m_orderBlocks[i].isBullish)
-            if(price >= m_orderBlocks[i].low && price <= m_orderBlocks[i].high)
-               return true;
-      return false;
-     }
-
-   //--- Is price inside any bullish FVG?
-   bool IsPriceInBullFVG(double price) const
-     {
-      for(int i = 0; i < m_fvgCount; i++)
-         if(m_fvgs[i].active && m_fvgs[i].isBullish)
-            if(price >= m_fvgs[i].lower && price <= m_fvgs[i].upper)
-               return true;
-      return false;
-     }
-
-   //--- Is price inside any bearish FVG?
-   bool IsPriceInBearFVG(double price) const
-     {
-      for(int i = 0; i < m_fvgCount; i++)
-         if(m_fvgs[i].active && !m_fvgs[i].isBullish)
-            if(price >= m_fvgs[i].lower && price <= m_fvgs[i].upper)
-               return true;
-      return false;
-     }
-
-   //--- Is last signal bullish setup?
-   bool HasBullishSetup() const
-     {
-      return (m_lastSignal == MS_BOS_BULL  ||
-              m_lastSignal == MS_CHOCH_BULL ||
-              m_lastSignal == MS_LIQ_SWEEP_L);
-     }
-
-   //--- Is last signal bearish setup?
-   bool HasBearishSetup() const
-     {
-      return (m_lastSignal == MS_BOS_BEAR  ||
-              m_lastSignal == MS_CHOCH_BEAR ||
-              m_lastSignal == MS_LIQ_SWEEP_H);
-     }
-
-   //--- Invalidate old order blocks that have been fully retested / breached
+   //--- Prune stale / breached OBs and filled FVGs
    void PruneStaleOBs()
      {
-      double askPrice = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
-      double bidPrice = SymbolInfoDouble(m_symbol, SYMBOL_BID);
-
+      double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
       for(int i = 0; i < m_obCount; i++)
         {
-         if(!m_orderBlocks[i].active) continue;
-
-         // Bullish OB invalidated if price breaks below OB low
-         if(m_orderBlocks[i].isBullish && bidPrice < m_orderBlocks[i].low)
-            m_orderBlocks[i].active = false;
-
-         // Bearish OB invalidated if price breaks above OB high
-         if(!m_orderBlocks[i].isBullish && askPrice > m_orderBlocks[i].high)
-            m_orderBlocks[i].active = false;
+         if(!m_obs[i].active) continue;
+         // Bullish OB broken if price closes below its low
+         if( m_obs[i].bullish && bid < m_obs[i].low)  m_obs[i].active = false;
+         // Bearish OB broken if price closes above its high
+         if(!m_obs[i].bullish && bid > m_obs[i].high) m_obs[i].active = false;
         }
-
-      // Prune filled FVGs
       for(int i = 0; i < m_fvgCount; i++)
         {
          if(!m_fvgs[i].active) continue;
-
-         // Bullish FVG filled when price retraces into it fully
-         if(m_fvgs[i].isBullish && bidPrice < m_fvgs[i].lower)
-            m_fvgs[i].active = false;
-
-         if(!m_fvgs[i].isBullish && askPrice > m_fvgs[i].upper)
-            m_fvgs[i].active = false;
+         // FVG considered filled when price moves through it
+         if(m_fvgs[i].bullish  && bid < m_fvgs[i].low)  m_fvgs[i].active = false;
+         if(!m_fvgs[i].bullish && bid > m_fvgs[i].high) m_fvgs[i].active = false;
         }
      }
 
-   //--- Get nearest bullish OB zone (returns false if none)
+   //+------------------------------------------------------------------+
+   //| Query methods                                                    |
+   //+------------------------------------------------------------------+
+   bool HasBOSBull()   const { return m_lastBOSBull;   }
+   bool HasBOSBear()   const { return m_lastBOSBear;   }
+   bool HasCHOCHBull() const { return m_lastCHOCHBull; }
+   bool HasCHOCHBear() const { return m_lastCHOCHBear; }
+   bool HasBullishStructure() const { return m_buStrucValid; }
+   bool HasBearishStructure() const { return m_beStrucValid; }
+
+   bool IsLiquiditySweepBull() const { return m_liqSweepBull; }
+   bool IsLiquiditySweepBear() const { return m_liqSweepBear; }
+
+   double GetLastSwingHigh() const { return m_lastSwingHigh; }
+   double GetLastSwingLow()  const { return m_lastSwingLow;  }
+   double GetPrevSwingHigh() const { return m_prevSwingHigh; }
+   double GetPrevSwingLow()  const { return m_prevSwingLow;  }
+
+   bool IsPriceInBullishOB(double price) const
+     {
+      for(int i = 0; i < m_obCount; i++)
+         if(m_obs[i].active && m_obs[i].bullish && price >= m_obs[i].low && price <= m_obs[i].high)
+            return true;
+      return false;
+     }
+
+   bool IsPriceInBearishOB(double price) const
+     {
+      for(int i = 0; i < m_obCount; i++)
+         if(m_obs[i].active && !m_obs[i].bullish && price >= m_obs[i].low && price <= m_obs[i].high)
+            return true;
+      return false;
+     }
+
+   bool IsPriceInBullFVG(double price) const
+     {
+      for(int i = 0; i < m_fvgCount; i++)
+         if(m_fvgs[i].active && m_fvgs[i].bullish && price >= m_fvgs[i].low && price <= m_fvgs[i].high)
+            return true;
+      return false;
+     }
+
+   bool IsPriceInBearFVG(double price) const
+     {
+      for(int i = 0; i < m_fvgCount; i++)
+         if(m_fvgs[i].active && !m_fvgs[i].bullish && price >= m_fvgs[i].low && price <= m_fvgs[i].high)
+            return true;
+      return false;
+     }
+
+   //--- Nearest bullish OB top/bottom
    bool GetNearestBullishOB(double &outLow, double &outHigh) const
      {
-      double price  = SymbolInfoDouble(m_symbol, SYMBOL_BID);
-      double minDist = DBL_MAX;
-      bool   found  = false;
-
+      double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+      double bestDist = DBL_MAX;
+      bool   found    = false;
       for(int i = 0; i < m_obCount; i++)
         {
-         if(!m_orderBlocks[i].active || !m_orderBlocks[i].isBullish) continue;
-         double mid  = (m_orderBlocks[i].high + m_orderBlocks[i].low) / 2.0;
-         double dist = MathAbs(price - mid);
-         if(dist < minDist)
-           {
-            minDist  = dist;
-            outLow   = m_orderBlocks[i].low;
-            outHigh  = m_orderBlocks[i].high;
-            found    = true;
-           }
+         if(!m_obs[i].active || !m_obs[i].bullish) continue;
+         double mid  = (m_obs[i].high + m_obs[i].low) * 0.5;
+         double dist = MathAbs(bid - mid);
+         if(dist < bestDist) { bestDist = dist; outLow = m_obs[i].low; outHigh = m_obs[i].high; found = true; }
         }
       return found;
      }
 
-   //--- Get nearest bearish OB zone
    bool GetNearestBearishOB(double &outLow, double &outHigh) const
      {
-      double price  = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
-      double minDist = DBL_MAX;
-      bool   found  = false;
-
+      double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+      double bestDist = DBL_MAX;
+      bool   found    = false;
       for(int i = 0; i < m_obCount; i++)
         {
-         if(!m_orderBlocks[i].active || m_orderBlocks[i].isBullish) continue;
-         double mid  = (m_orderBlocks[i].high + m_orderBlocks[i].low) / 2.0;
-         double dist = MathAbs(price - mid);
-         if(dist < minDist)
-           {
-            minDist  = dist;
-            outLow   = m_orderBlocks[i].low;
-            outHigh  = m_orderBlocks[i].high;
-            found    = true;
-           }
+         if(!m_obs[i].active || m_obs[i].bullish) continue;
+         double mid  = (m_obs[i].high + m_obs[i].low) * 0.5;
+         double dist = MathAbs(bid - mid);
+         if(dist < bestDist) { bestDist = dist; outLow = m_obs[i].low; outHigh = m_obs[i].high; found = true; }
         }
       return found;
      }
-
-   //--- String summary for dashboard
-   string GetStructureSummary() const
-     {
-      string sig = "";
-      switch(m_lastSignal)
-        {
-         case MS_BOS_BULL:    sig = "BOS↑";   break;
-         case MS_BOS_BEAR:    sig = "BOS↓";   break;
-         case MS_CHOCH_BULL:  sig = "CHOCH↑"; break;
-         case MS_CHOCH_BEAR:  sig = "CHOCH↓"; break;
-         case MS_LIQ_SWEEP_H: sig = "LiqSwp↑"; break;
-         case MS_LIQ_SWEEP_L: sig = "LiqSwp↓"; break;
-         default:             sig = "None";
-        }
-      return StringFormat("Sig=%s SH=%.2f SL=%.2f OBs=%d FVGs=%d",
-         sig, m_lastSwingHigh, m_lastSwingLow, m_obCount, m_fvgCount);
-     }
   };
-//+------------------------------------------------------------------+
+
 #endif // MARKETSTRUCTURE_MQH

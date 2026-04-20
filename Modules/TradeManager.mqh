@@ -1,242 +1,147 @@
-﻿//+------------------------------------------------------------------+
-//|                                                 TradeManager.mqh |
-//|                          EA102 - XAUUSD Prop Firm EA             |
-//|              Trade Execution, Modification, and Tracking         |
+//+------------------------------------------------------------------+
+//|                                                TradeManager.mqh  |
+//|                        EA102 v2 - XAUUSD Prop Firm EA            |
+//|              CTrade wrapper: open, close, modify, partial        |
 //+------------------------------------------------------------------+
 #ifndef TRADEMANAGER_MQH
 #define TRADEMANAGER_MQH
+
 #include "Utilities.mqh"
-#include "EntryEngine.mqh"
 #include <Trade\Trade.mqh>
 
+//--- Shared entry confirmation struct (used by EntryEngine + MainEA + TradeManager)
+struct EntryConfirmation
+  {
+   bool            confirmed;
+   ENUM_SIGNAL_DIR direction;
+   ENUM_SIGNAL_TYPE signalType;
+   double          entryPrice;
+   double          stopLoss;
+   double          takeProfit;
+   double          score;
+   string          reason;
+  };
+
 //+------------------------------------------------------------------+
-//| CTradeManager class                                              |
+//| CTradeManager                                                    |
 //+------------------------------------------------------------------+
 class CTradeManager
   {
 private:
-   CTrade            m_trade;
-   string            m_symbol;
-   int               m_magicNumber;
-   int               m_slippage;
-   string            m_tradeComment;
+   string   m_symbol;
+   int      m_magic;
+   int      m_slippage;
+   string   m_comment;
+   CTrade   m_trade;
 
 public:
    CTradeManager() {}
-   ~CTradeManager() {}
 
-   bool Init(const string symbol, int magicNumber, int slippage, const string comment)
+   bool Init(const string symbol, int magic, int slippage, const string comment)
      {
-      m_symbol       = symbol;
-      m_magicNumber  = magicNumber;
-      m_slippage     = slippage;
-      m_tradeComment = comment;
-
-      m_trade.SetExpertMagicNumber(magicNumber);
+      m_symbol   = symbol;
+      m_magic    = magic;
+      m_slippage = slippage;
+      m_comment  = comment;
+      m_trade.SetExpertMagicNumber(magic);
       m_trade.SetDeviationInPoints(slippage);
-      m_trade.SetTypeFilling(ORDER_FILLING_IOC);
-      m_trade.SetAsyncMode(false);
-
-      LogInfo("TradeManager", StringFormat(
-         "Init | %s | Magic=%d | Slippage=%d", symbol, magicNumber, slippage));
+      LogInfo("TradeManager", StringFormat("Init | Symbol=%s Magic=%d Slip=%d", symbol, magic, slippage));
       return true;
      }
 
-   //--- Open a market order from EntryConfirmation
-   bool OpenTrade(const EntryConfirmation &ec, double lots, ulong &outTicket)
+   //--- Open a market order from an EntryConfirmation
+   bool OpenTrade(const EntryConfirmation &ec, double lots, ulong &ticket)
      {
-      outTicket = 0;
-
-      if(!ec.confirmed)
-        {
-         LogWarn("TradeManager", "Entry not confirmed, skipping open");
-         return false;
-        }
-      if(lots <= 0)
-        {
-         LogWarn("TradeManager", "Lot size=0, skipping");
-         return false;
-        }
+      ticket = 0;
+      if(!ec.confirmed || lots <= 0) return false;
 
       bool ok = false;
+      string cmt = m_comment + StringFormat("|%.2f|%s", ec.score, SignalTypeStr(ec.signalType));
 
       if(ec.direction == SIGNAL_BUY)
-        {
-         ok = m_trade.Buy(lots, m_symbol, ec.entryPrice, ec.stopLoss, ec.takeProfit, m_tradeComment);
-        }
-      else if(ec.direction == SIGNAL_SELL)
-        {
-         ok = m_trade.Sell(lots, m_symbol, ec.entryPrice, ec.stopLoss, ec.takeProfit, m_tradeComment);
-        }
+         ok = m_trade.Buy(lots, m_symbol, 0, ec.stopLoss, ec.takeProfit, cmt);
       else
-        {
-         LogWarn("TradeManager", "Direction NONE — skipping trade");
-         return false;
-        }
+         ok = m_trade.Sell(lots, m_symbol, 0, ec.stopLoss, ec.takeProfit, cmt);
 
       if(ok)
         {
-         outTicket = m_trade.ResultOrder();
-         LogInfo("TradeManager", StringFormat(
-            "Opened | %s %.2f lots | Entry=%.5f SL=%.5f TP=%.5f | Ticket=%llu",
-            (ec.direction == SIGNAL_BUY ? "BUY" : "SELL"),
-            lots, ec.entryPrice, ec.stopLoss, ec.takeProfit, outTicket));
+         ticket = m_trade.ResultOrder();
+         LogInfo("TradeManager", StringFormat("OPEN %s | Lots=%.2f SL=%.5f TP=%.5f Ticket=%I64u",
+                 SignalDirStr(ec.direction), lots, ec.stopLoss, ec.takeProfit, ticket));
         }
       else
         {
-         LogError("TradeManager", StringFormat(
-            "Open FAILED | retcode=%d err=%s",
-            m_trade.ResultRetcode(), m_trade.ResultRetcodeDescription()));
+         LogError("TradeManager", StringFormat("Open failed | Ret=%d Err=%s",
+                  m_trade.ResultRetcode(), m_trade.ResultComment()));
         }
 
       return ok;
      }
 
-   //--- Modify SL / TP of an existing position
-   bool ModifyPosition(ulong ticket, double newSL, double newTP = 0)
+   //--- Modify SL / TP
+   bool ModifyPosition(ulong ticket, double sl, double tp)
      {
-      if(!PositionSelectByTicket(ticket))
-        {
-         LogWarn("TradeManager", StringFormat("ModifyPos: ticket %llu not found", ticket));
-         return false;
-        }
-
-      double currentSL = PositionGetDouble(POSITION_SL);
-      double currentTP = PositionGetDouble(POSITION_TP);
-
-      // Use existing TP if not supplied
-      if(newTP == 0) newTP = currentTP;
-
-      // Only modify if values actually changed
-      double pt = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
-      if(MathAbs(newSL - currentSL) < pt && MathAbs(newTP - currentTP) < pt)
-         return true;
-
-      bool ok = m_trade.PositionModify(ticket, newSL, newTP);
-      if(ok)
-        {
-         LogDebug("TradeManager", StringFormat(
-            "Modified ticket=%llu | SL=%.5f TP=%.5f", ticket, newSL, newTP));
-        }
-      else
-        {
-         LogError("TradeManager", StringFormat(
-            "Modify FAILED ticket=%llu | retcode=%d", ticket, m_trade.ResultRetcode()));
-        }
+      if(!PositionSelectByTicket(ticket)) return false;
+      if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) return false;
+      bool ok = m_trade.PositionModify(ticket, sl, tp);
+      if(!ok) LogWarn("TradeManager", StringFormat("Modify failed ticket=%I64u", ticket));
       return ok;
      }
 
-   //--- Close a position fully
+   //--- Full close
    bool ClosePosition(ulong ticket)
      {
-      if(!PositionSelectByTicket(ticket))
-        {
-         LogWarn("TradeManager", StringFormat("ClosePos: ticket %llu not found", ticket));
-         return false;
-        }
-
-      bool ok = m_trade.PositionClose(ticket, m_slippage);
-      if(ok)
-         LogInfo("TradeManager", StringFormat("Closed ticket=%llu", ticket));
-      else
-         LogError("TradeManager", StringFormat(
-            "Close FAILED ticket=%llu retcode=%d", ticket, m_trade.ResultRetcode()));
-
+      if(!PositionSelectByTicket(ticket)) return false;
+      if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) return false;
+      bool ok = m_trade.PositionClose(ticket);
+      if(!ok) LogWarn("TradeManager", StringFormat("Close failed ticket=%I64u", ticket));
       return ok;
      }
 
-   //--- Close partial volume of a position
-   bool ClosePartial(ulong ticket, double closeLots)
+   //--- Partial close (reduce volume)
+   bool ClosePartial(ulong ticket, double lots)
      {
-      if(!PositionSelectByTicket(ticket))
-        {
-         LogWarn("TradeManager", StringFormat("ClosePartial: ticket %llu not found", ticket));
-         return false;
-        }
-
-      double posVol   = PositionGetDouble(POSITION_VOLUME);
-      double minLot   = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
-      double lotStep  = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_STEP);
-
-      // Clamp close volume to available, leaving at least minLot behind
-      closeLots = MathMin(closeLots, posVol - minLot);
-      closeLots = MathMax(closeLots, minLot);
-      closeLots = NormalizeLots(m_symbol, closeLots);
-
-      if(closeLots <= 0)
-        {
-         LogWarn("TradeManager", "ClosePartial: too small to close");
-         return false;
-        }
-
-      ENUM_POSITION_TYPE ptype   = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      ENUM_ORDER_TYPE    ordType = (ptype == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-      double             price   = (ordType == ORDER_TYPE_BUY)
-                                   ? SymbolInfoDouble(m_symbol, SYMBOL_ASK)
-                                   : SymbolInfoDouble(m_symbol, SYMBOL_BID);
-
-      MqlTradeRequest req = {};
-      MqlTradeResult  res = {};
-      req.action    = TRADE_ACTION_DEAL;
-      req.symbol    = m_symbol;
-      req.volume    = closeLots;
-      req.type      = ordType;
-      req.price     = price;
-      req.deviation = m_slippage;
-      req.position  = ticket;
-      req.magic     = m_magicNumber;
-      req.comment   = m_tradeComment + "_partial";
-      req.type_filling = ORDER_FILLING_IOC;
-
-      bool ok = OrderSend(req, res);
-      if(ok && res.retcode <= TRADE_RETCODE_PLACED)
-        {
-         LogInfo("TradeManager", StringFormat(
-            "Partial close %.2f lots | ticket=%llu", closeLots, ticket));
-         return true;
-        }
-      else
-        {
-         LogError("TradeManager", StringFormat(
-            "Partial close FAILED ticket=%llu retcode=%d", ticket, res.retcode));
-         return false;
-        }
+      if(!PositionSelectByTicket(ticket)) return false;
+      if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) return false;
+      double curLots = PositionGetDouble(POSITION_VOLUME);
+      double mn      = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
+      lots = NormalizeLots(m_symbol, MathMin(lots, curLots - mn));
+      if(lots < mn) return false;
+      bool ok = m_trade.PositionClosePartial(ticket, lots);
+      if(!ok) LogWarn("TradeManager", StringFormat("PartialClose failed ticket=%I64u lots=%.2f", ticket, lots));
+      return ok;
      }
 
-   //--- Close all positions for this EA
+   //--- Close all EA positions (emergency / session end)
    void CloseAllPositions(const string reason)
      {
-      LogWarn("TradeManager", "CloseAll: " + reason);
+      LogWarn("TradeManager", "Close ALL | " + reason);
       for(int i = PositionsTotal() - 1; i >= 0; i--)
         {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket == 0) continue;
+         ulong t = PositionGetTicket(i);
+         if(!PositionSelectByTicket(t)) continue;
          if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if((int)PositionGetInteger(POSITION_MAGIC) != m_magicNumber) continue;
-         ClosePosition(ticket);
+         if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) continue;
+         m_trade.PositionClose(t);
         }
      }
 
-   //--- Collect all open ticket numbers for this EA
-   int GetOpenTickets(ulong &tickets[])
+   //--- Get all open EA tickets
+   int GetOpenTickets(ulong &tickets[]) const
      {
       ArrayResize(tickets, 0);
-      int count = 0;
+      int cnt = 0;
       for(int i = 0; i < PositionsTotal(); i++)
         {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket == 0) continue;
+         ulong t = PositionGetTicket(i);
+         if(!PositionSelectByTicket(t)) continue;
          if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if((int)PositionGetInteger(POSITION_MAGIC) != m_magicNumber) continue;
-         ArrayResize(tickets, count + 1);
-         tickets[count++] = ticket;
+         if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) continue;
+         ArrayResize(tickets, cnt + 1);
+         tickets[cnt++] = t;
         }
-      return count;
+      return cnt;
      }
-
-   string GetSymbol()      const { return m_symbol; }
-   int    GetMagic()       const { return m_magicNumber; }
-   CTrade *GetTrade()            { return &m_trade; }
   };
-//+------------------------------------------------------------------+
+
 #endif // TRADEMANAGER_MQH

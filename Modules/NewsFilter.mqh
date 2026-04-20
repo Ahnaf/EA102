@@ -1,233 +1,153 @@
-﻿//+------------------------------------------------------------------+
-//|                                                   NewsFilter.mqh |
-//|                          EA102 - XAUUSD Prop Firm EA             |
-//|         High-impact news detection via manually entered events   |
+//+------------------------------------------------------------------+
+//|                                                  NewsFilter.mqh  |
+//|                        EA102 v2 - XAUUSD Prop Firm EA            |
+//|              High-impact news blocking (manual + auto NFP/FOMC) |
 //+------------------------------------------------------------------+
 #ifndef NEWSFILTER_MQH
 #define NEWSFILTER_MQH
+
 #include "Utilities.mqh"
 
-//+------------------------------------------------------------------+
-//| A single news event entry                                        |
-//+------------------------------------------------------------------+
+#define MAX_NEWS_EVENTS 20
+
 struct NewsEvent
   {
-   datetime eventTime;       // Exact server time of news release
-   string   description;     // e.g. "US NFP", "FOMC"
-   int      minsBefore;      // Block X mins before event
-   int      minsAfter;       // Block X mins after event
-   bool     active;
+   datetime eventTime;
+   int      minsBefore;
+   int      minsAfter;
+   string   description;
   };
 
 //+------------------------------------------------------------------+
-//| CNewsFilter class                                                |
-//| NOTE: MT5 does not provide a built-in live economic calendar     |
-//| API. This module supports two mechanisms:                        |
-//|  1. Manual events — user enters times via input arrays           |
-//|  2. Auto-block by weekday/time pattern (e.g. NFP Friday 12:30)  |
+//| CNewsFilter                                                      |
 //+------------------------------------------------------------------+
 class CNewsFilter
   {
 private:
-   NewsEvent   m_events[50];     // Up to 50 manual news events
-   int         m_eventCount;
-
-   bool        m_filterEnabled;
-   int         m_defaultMinsBefore;
-   int         m_defaultMinsAfter;
-
-   // Auto-block: block all trades on NFP Fridays
-   bool        m_autoBlockNFP;
-   int         m_nfpHour;        // Server hour of NFP (usually 12 UTC)
-   int         m_nfpWindowMins;  // +/- minutes around NFP time
-
-   // Auto-block: FOMC (Wednesday/Thursday 18:00 UTC)
-   bool        m_autoBlockFOMC;
-   int         m_fomcHour;
+   bool      m_filterEnabled;
+   int       m_defaultMinsBefore;
+   int       m_defaultMinsAfter;
+   bool      m_autoBlockNFP;
+   int       m_nfpHour;
+   int       m_nfpWindowMins;
+   bool      m_autoBlockFOMC;
+   int       m_fomcHour;
+   NewsEvent m_events[MAX_NEWS_EVENTS];
+   int       m_eventCount;
+   string    m_blockReason;
 
 public:
-   CNewsFilter() : m_eventCount(0), m_filterEnabled(true) {}
-   ~CNewsFilter() {}
+   CNewsFilter() : m_filterEnabled(true), m_defaultMinsBefore(30),
+                   m_defaultMinsAfter(15), m_autoBlockNFP(true),
+                   m_nfpHour(12), m_nfpWindowMins(60),
+                   m_autoBlockFOMC(true), m_fomcHour(18),
+                   m_eventCount(0), m_blockReason("") {}
 
-   //--- Initialise filter
-   bool Init(bool   filterEnabled,
-             int    defaultMinsBefore,
-             int    defaultMinsAfter,
-             bool   autoBlockNFP,
-             int    nfpHour,
-             int    nfpWindowMins,
-             bool   autoBlockFOMC,
-             int    fomcHour)
+   bool Init(bool filterEnabled, int minsBefore, int minsAfter,
+             bool autoNFP, int nfpHour, int nfpWindowMins,
+             bool autoFOMC, int fomcHour)
      {
-      m_filterEnabled      = filterEnabled;
-      m_defaultMinsBefore  = defaultMinsBefore;
-      m_defaultMinsAfter   = defaultMinsAfter;
-      m_autoBlockNFP       = autoBlockNFP;
-      m_nfpHour            = nfpHour;
-      m_nfpWindowMins      = nfpWindowMins;
-      m_autoBlockFOMC      = autoBlockFOMC;
-      m_fomcHour           = fomcHour;
-      m_eventCount         = 0;
-
-      LogInfo("NewsFilter", StringFormat(
-         "Init | Enabled=%s | DefaultWindow=[-%dm,+%dm] | AutoNFP=%s | AutoFOMC=%s",
-         filterEnabled ? "YES" : "NO",
-         defaultMinsBefore, defaultMinsAfter,
-         autoBlockNFP ? "YES" : "NO",
-         autoBlockFOMC ? "YES" : "NO"));
+      m_filterEnabled     = filterEnabled;
+      m_defaultMinsBefore = minsBefore;
+      m_defaultMinsAfter  = minsAfter;
+      m_autoBlockNFP      = autoNFP;
+      m_nfpHour           = nfpHour;
+      m_nfpWindowMins     = nfpWindowMins;
+      m_autoBlockFOMC     = autoFOMC;
+      m_fomcHour          = fomcHour;
+      m_eventCount        = 0;
+      LogInfo("NewsFilter", StringFormat("Init | Filter=%s NFP=%s FOMC=%s Before=%dm After=%dm",
+              filterEnabled?"ON":"OFF", autoNFP?"ON":"OFF", autoFOMC?"ON":"OFF",
+              minsBefore, minsAfter));
       return true;
      }
 
-   //--- Add a manual news event (called from EA inputs processing)
    bool AddEvent(datetime eventTime, const string desc, int minsBefore = -1, int minsAfter = -1)
      {
-      if(m_eventCount >= 50)
-        {
-         LogWarn("NewsFilter", "Max events (50) reached");
-         return false;
-        }
-      if(eventTime == 0) return false;
-
+      if(m_eventCount >= MAX_NEWS_EVENTS) { LogWarn("NewsFilter", "Event list full"); return false; }
       m_events[m_eventCount].eventTime   = eventTime;
       m_events[m_eventCount].description = desc;
       m_events[m_eventCount].minsBefore  = (minsBefore < 0) ? m_defaultMinsBefore : minsBefore;
       m_events[m_eventCount].minsAfter   = (minsAfter  < 0) ? m_defaultMinsAfter  : minsAfter;
-      m_events[m_eventCount].active      = true;
       m_eventCount++;
-
-      LogInfo("NewsFilter", StringFormat(
-         "Event added: %s @ %s [-%dm, +%dm]",
-         desc, TimeToString(eventTime, TIME_DATE | TIME_MINUTES),
-         m_events[m_eventCount - 1].minsBefore,
-         m_events[m_eventCount - 1].minsAfter));
+      LogInfo("NewsFilter", StringFormat("Added: %s @ %s", desc, TimeToString(eventTime)));
       return true;
      }
 
-   //--- Parse a datetime from string "YYYY.MM.DD HH:MM" and add event
-   bool AddEventFromString(const string dtStr, const string desc,
-                           int minsBefore = -1, int minsAfter = -1)
+   bool AddEventFromString(const string dtStr, const string desc, int minsBefore = -1, int minsAfter = -1)
      {
       datetime t = StringToTime(dtStr);
-      if(t == 0)
-        {
-         LogWarn("NewsFilter", "Invalid datetime string: " + dtStr);
-         return false;
-        }
+      if(t <= 0) { LogWarn("NewsFilter", "Bad datetime: " + dtStr); return false; }
       return AddEvent(t, desc, minsBefore, minsAfter);
      }
 
-   //--- Is trading blocked right now?
-   bool IsNewsBlocked() const
+   bool IsNewsBlocked()
      {
       if(!m_filterEnabled) return false;
-
       datetime now = TimeCurrent();
+      m_blockReason = "";
 
-      // 1. Check manual events
+      // Check manual events
       for(int i = 0; i < m_eventCount; i++)
         {
-         if(!m_events[i].active) continue;
-
-         datetime blockStart = m_events[i].eventTime - m_events[i].minsBefore * 60;
-         datetime blockEnd   = m_events[i].eventTime + m_events[i].minsAfter  * 60;
-
-         if(now >= blockStart && now <= blockEnd)
+         datetime before = m_events[i].eventTime - m_events[i].minsBefore * 60;
+         datetime after  = m_events[i].eventTime + m_events[i].minsAfter  * 60;
+         if(now >= before && now <= after)
            {
-            LogDebug("NewsFilter", StringFormat(
-               "Blocked by event: %s (window %s to %s)",
-               m_events[i].description,
-               TimeToString(blockStart, TIME_MINUTES),
-               TimeToString(blockEnd,   TIME_MINUTES)));
+            m_blockReason = m_events[i].description;
             return true;
            }
         }
 
-      // 2. Auto-block: NFP (first Friday of month, ~12:30 UTC)
-      if(m_autoBlockNFP && IsNFPPeriod(now))
-         return true;
+      // Auto NFP: first Friday of every month at nfpHour UTC
+      if(m_autoBlockNFP)
+        {
+         MqlDateTime dt;
+         TimeToStruct(now, dt);
+         if(dt.day_of_week == 5 && dt.day <= 7)  // First Friday
+           {
+            int nowMins  = dt.hour * 60 + dt.min;
+            int nfpMins  = m_nfpHour * 60;
+            if(nowMins >= nfpMins - m_nfpWindowMins && nowMins <= nfpMins + m_nfpWindowMins)
+              {
+               m_blockReason = "NFP";
+               return true;
+              }
+           }
+        }
 
-      // 3. Auto-block: FOMC
-      if(m_autoBlockFOMC && IsFOMCPeriod(now))
-         return true;
+      // Auto FOMC: Wednesday and Thursday around fomcHour
+      if(m_autoBlockFOMC)
+        {
+         MqlDateTime dt;
+         TimeToStruct(now, dt);
+         if(dt.day_of_week == 3 || dt.day_of_week == 4)
+           {
+            int nowMins  = dt.hour * 60 + dt.min;
+            int fomcMins = m_fomcHour * 60;
+            if(nowMins >= fomcMins - 30 && nowMins <= fomcMins + 15)
+              {
+               m_blockReason = "FOMC";
+               return true;
+              }
+           }
+        }
 
       return false;
      }
 
-   //--- Return reason string if blocked
-   string GetBlockReason() const
-     {
-      if(!m_filterEnabled) return "NewsFilter OFF";
+   string GetBlockReason() const { return m_blockReason; }
 
+   bool IsApproachingNews(int withinMins = 15) const
+     {
       datetime now = TimeCurrent();
-
       for(int i = 0; i < m_eventCount; i++)
         {
-         if(!m_events[i].active) continue;
-         datetime blockStart = m_events[i].eventTime - m_events[i].minsBefore * 60;
-         datetime blockEnd   = m_events[i].eventTime + m_events[i].minsAfter  * 60;
-         if(now >= blockStart && now <= blockEnd)
-            return "NEWS: " + m_events[i].description;
-        }
-
-      if(m_autoBlockNFP && IsNFPPeriod(now))  return "AUTO-BLOCK: NFP";
-      if(m_autoBlockFOMC && IsFOMCPeriod(now)) return "AUTO-BLOCK: FOMC";
-
-      return "";
-     }
-
-   //--- Are we currently in alert window (within X mins of next news)?
-   bool IsApproachingNews(int lookAheadMins = 5) const
-     {
-      if(!m_filterEnabled) return false;
-      datetime now     = TimeCurrent();
-      datetime horizon = now + lookAheadMins * 60;
-
-      for(int i = 0; i < m_eventCount; i++)
-        {
-         if(!m_events[i].active) continue;
-         datetime blockStart = m_events[i].eventTime - m_events[i].minsBefore * 60;
-         if(blockStart > now && blockStart <= horizon)
-            return true;
+         long diff = (long)m_events[i].eventTime - (long)now;
+         if(diff >= 0 && diff <= withinMins * 60) return true;
         }
       return false;
-     }
-
-private:
-   //--- Check if current time is within NFP auto-block window
-   //--- NFP = first Friday of month, typically 12:30 UTC
-   bool IsNFPPeriod(datetime now) const
-     {
-      MqlDateTime mdt;
-      TimeToStruct(now, mdt);
-
-      // Must be a Friday
-      if(mdt.day_of_week != 5) return false;
-
-      // Must be in first 7 days of month
-      if(mdt.day > 7) return false;
-
-      // Must be within window of NFP hour
-      int nowMin   = mdt.hour * 60 + mdt.min;
-      int nfpMin   = m_nfpHour * 60 + 30;
-      int winStart = nfpMin - m_nfpWindowMins;
-      int winEnd   = nfpMin + m_nfpWindowMins;
-
-      return (nowMin >= winStart && nowMin <= winEnd);
-     }
-
-   //--- FOMC: typically Wed/Thu at fomcHour UTC (e.g. 18:00)
-   bool IsFOMCPeriod(datetime now) const
-     {
-      MqlDateTime mdt;
-      TimeToStruct(now, mdt);
-
-      // Wednesday = 3, Thursday = 4 in MQL5
-      if(mdt.day_of_week != 3 && mdt.day_of_week != 4) return false;
-
-      int nowHour = mdt.hour;
-      // Block from fomcHour to fomcHour+2
-      return (nowHour >= m_fomcHour && nowHour < m_fomcHour + 2);
      }
   };
-//+------------------------------------------------------------------+
+
 #endif // NEWSFILTER_MQH

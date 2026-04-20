@@ -1,280 +1,155 @@
-﻿//+------------------------------------------------------------------+
-//|                                                PropProtection.mqh|
-//|                          EA102 - XAUUSD Prop Firm EA             |
-//|            Prop Firm Compliance: DD limits, emergency close      |
+//+------------------------------------------------------------------+
+//|                                               PropProtection.mqh |
+//|                        EA102 v2 - XAUUSD Prop Firm EA            |
+//|              Prop firm drawdown protection & emergency controls  |
 //+------------------------------------------------------------------+
 #ifndef PROPPROTECTION_MQH
 #define PROPPROTECTION_MQH
+
 #include "Utilities.mqh"
+#include <Trade\Trade.mqh>
 
 //+------------------------------------------------------------------+
-//| Prop Protection State structure                                  |
-//+------------------------------------------------------------------+
-struct PropState
-  {
-   double   startingBalance;      // Balance at EA start (or day start)
-   double   dailyStartBalance;    // Balance at start of trading day
-   double   maxEquityHigh;        // Highest equity reached (for max DD calc)
-   double   dailyRealizedPL;      // Realised P/L today (closed trades)
-   double   dailyPeakEquity;      // Peak equity today (for daily DD calc)
-
-   bool     maxDDBreached;        // True = hard stop, no more trades ever
-   bool     dailyDDBlocked;       // True = blocked for rest of today
-   bool     dailyProfitLocked;    // True = daily profit target hit, lock gains
-   bool     emergencyClosed;      // True = emergency close was executed
-
-   datetime lastDayChecked;       // Date of last daily reset
-  };
-
-//+------------------------------------------------------------------+
-//| CPropProtection class                                            |
+//| CPropProtection — enforces FTMO / FundedNext rules              |
 //+------------------------------------------------------------------+
 class CPropProtection
   {
 private:
-   PropState   m_state;
+   string   m_symbol;
+   int      m_magic;
 
-   // Input parameters
-   double      m_maxDDPercent;          // e.g. 10.0 = 10%
-   double      m_dailyDDPercent;        // e.g. 5.0  = 5%
-   double      m_dailyProfitLockPct;    // e.g. 3.0  = 3% optional lock
-   bool        m_useDailyProfitLock;
-   bool        m_useEmergencyClose;
-   string      m_symbol;
+   //--- Limits
+   double   m_maxDDPct;          // Hard stop (e.g. 10%)
+   double   m_dailyDDPct;        // Daily limit (e.g. 5%)
+   bool     m_useProfitLock;
+   double   m_profitLockPct;
+   bool     m_useEmergencyClose;
 
-   // Internal
-   double      m_maxDDThreshold;        // Absolute equity floor for max DD
-   double      m_accountStartBalance;   // Starting balance of the account
+   //--- State
+   bool     m_maxDDBreached;
+   bool     m_dailyDDBlocked;
+   bool     m_profitLocked;
 
-   //--- Build CTrade reference for emergency close
-   int         m_magicNumber;
+   //--- Tracking
+   double   m_startBalance;      // Balance at EA init
+   double   m_dayStartEquity;    // Equity at last day reset
+   double   m_dayPL;             // Today's P/L
+   datetime m_lastDayReset;
+
+   CTrade   m_trade;
 
 public:
-   CPropProtection() {}
-   ~CPropProtection() {}
+   CPropProtection() : m_maxDDBreached(false), m_dailyDDBlocked(false),
+                       m_profitLocked(false), m_startBalance(0),
+                       m_dayStartEquity(0), m_dayPL(0), m_lastDayReset(0) {}
 
-   //--- Initialise with parameters
-   bool Init(const string symbol,
-             double maxDDPct,
-             double dailyDDPct,
-             bool   useProfitLock,
-             double profitLockPct,
-             bool   useEmergencyClose,
-             int    magicNumber)
+   bool Init(const string symbol, double maxDDPct, double dailyDDPct,
+             bool useProfitLock, double profitLockPct,
+             bool useEmergencyClose, int magic)
      {
-      m_symbol              = symbol;
-      m_maxDDPercent        = maxDDPct;
-      m_dailyDDPercent      = dailyDDPct;
-      m_useDailyProfitLock  = useProfitLock;
-      m_dailyProfitLockPct  = profitLockPct;
-      m_useEmergencyClose   = useEmergencyClose;
-      m_magicNumber         = magicNumber;
-
-      double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-      m_accountStartBalance         = bal;
-      m_state.startingBalance       = bal;
-      m_state.dailyStartBalance     = bal;
-      m_state.maxEquityHigh         = AccountInfoDouble(ACCOUNT_EQUITY);
-      m_state.dailyPeakEquity       = m_state.maxEquityHigh;
-      m_state.dailyRealizedPL       = 0;
-      m_state.maxDDBreached         = false;
-      m_state.dailyDDBlocked        = false;
-      m_state.dailyProfitLocked     = false;
-      m_state.emergencyClosed       = false;
-      m_state.lastDayChecked        = TimeCurrent();
-
-      // Max DD threshold = starting balance * (1 - maxDDPct/100)
-      m_maxDDThreshold = m_accountStartBalance * (1.0 - m_maxDDPercent / 100.0);
-
-      LogInfo("PropProtection", StringFormat(
-         "Initialised | StartBal=%.2f | MaxDD=%.1f%% | DailyDD=%.1f%%",
-         bal, m_maxDDPercent, m_dailyDDPercent));
+      m_symbol           = symbol;
+      m_maxDDPct         = maxDDPct;
+      m_dailyDDPct       = dailyDDPct;
+      m_useProfitLock    = useProfitLock;
+      m_profitLockPct    = profitLockPct;
+      m_useEmergencyClose = useEmergencyClose;
+      m_magic            = magic;
+      m_startBalance     = AccountInfoDouble(ACCOUNT_BALANCE);
+      m_dayStartEquity   = AccountInfoDouble(ACCOUNT_EQUITY);
+      m_lastDayReset     = GetDayStart();
+      m_trade.SetExpertMagicNumber(magic);
+      LogInfo("PropProtection", StringFormat("Init | MaxDD=%.1f%% DailyDD=%.1f%% StartBal=%.2f",
+              maxDDPct, dailyDDPct, m_startBalance));
       return true;
      }
 
-   //--- Call every tick / bar
+   //--- Call every tick
    void Update()
      {
-      DailyReset();
-      CheckMaxDD();
-      CheckDailyDD();
-      if(m_useDailyProfitLock) CheckDailyProfitLock();
-     }
-
-   //--- Reset daily counters at new trading day
-   void DailyReset()
-     {
-      datetime now = TimeCurrent();
-      if(!SameDay(now, m_state.lastDayChecked))
+      // Daily reset
+      datetime today = GetDayStart();
+      if(today != m_lastDayReset)
         {
-         m_state.dailyStartBalance   = AccountInfoDouble(ACCOUNT_BALANCE);
-         m_state.dailyPeakEquity     = AccountInfoDouble(ACCOUNT_EQUITY);
-         m_state.dailyRealizedPL     = 0;
-         m_state.dailyDDBlocked      = false;   // Unblock at new day
-         m_state.dailyProfitLocked   = false;
-         m_state.lastDayChecked      = now;
-         LogInfo("PropProtection", StringFormat(
-            "New day reset | DayBal=%.2f", m_state.dailyStartBalance));
+         m_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+         m_dailyDDBlocked = false;
+         m_profitLocked   = false;
+         m_lastDayReset   = today;
         }
-     }
-
-   //--- Check max drawdown against highest equity
-   void CheckMaxDD()
-     {
-      if(m_state.maxDDBreached) return; // Already triggered
-
-      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-
-      // Update peak equity
-      if(equity > m_state.maxEquityHigh)
-         m_state.maxEquityHigh = equity;
-
-      // DD from absolute starting balance (FTMO style)
-      double ddFromStart = (m_accountStartBalance - equity) / m_accountStartBalance * 100.0;
-
-      if(ddFromStart >= m_maxDDPercent)
-        {
-         m_state.maxDDBreached = true;
-         LogError("PropProtection", StringFormat(
-            "MAX DRAWDOWN BREACHED! DD=%.2f%% | Equity=%.2f | Threshold=%.2f%%",
-            ddFromStart, equity, m_maxDDPercent));
-
-         if(m_useEmergencyClose)
-            EmergencyCloseAll("MAX DD BREACHED");
-        }
-     }
-
-   //--- Check daily drawdown
-   void CheckDailyDD()
-     {
-      if(m_state.dailyDDBlocked) return;
-
-      double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
-      double dayStart  = m_state.dailyStartBalance;
-
-      // Update today's peak equity
-      if(equity > m_state.dailyPeakEquity)
-         m_state.dailyPeakEquity = equity;
-
-      // DD from today's start balance (strict prop firm rule)
-      double dailyDD = (dayStart - equity) / dayStart * 100.0;
-
-      if(dailyDD >= m_dailyDDPercent)
-        {
-         m_state.dailyDDBlocked = true;
-         LogError("PropProtection", StringFormat(
-            "DAILY DD BREACHED! DD=%.2f%% | Equity=%.2f | DayStart=%.2f",
-            dailyDD, equity, dayStart));
-
-         if(m_useEmergencyClose)
-            EmergencyCloseAll("DAILY DD BREACHED");
-        }
-     }
-
-   //--- Check daily profit lock
-   void CheckDailyProfitLock()
-     {
-      if(m_state.dailyProfitLocked) return;
 
       double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
-      double dayStart = m_state.dailyStartBalance;
-      double profitPct = (equity - dayStart) / dayStart * 100.0;
+      double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+      m_dayPL         = equity - m_dayStartEquity;
 
-      if(profitPct >= m_dailyProfitLockPct)
+      // Max DD check (from start balance)
+      double maxDDNow = (m_startBalance > 0) ? (m_startBalance - equity) / m_startBalance * 100.0 : 0;
+      if(!m_maxDDBreached && maxDDNow >= m_maxDDPct)
         {
-         m_state.dailyProfitLocked = true;
-         LogInfo("PropProtection", StringFormat(
-            "Daily profit lock triggered at +%.2f%%", profitPct));
+         m_maxDDBreached = true;
+         LogError("PropProtection", StringFormat("MAX DD BREACHED! DD=%.2f%% >= %.1f%%", maxDDNow, m_maxDDPct));
+         if(m_useEmergencyClose) EmergencyCloseAll("MAX DD");
+        }
+
+      // Daily DD check
+      if(!m_dailyDDBlocked)
+        {
+         double dailyDDNow = (m_dayStartEquity > 0) ? (m_dayStartEquity - equity) / m_dayStartEquity * 100.0 : 0;
+         if(dailyDDNow >= m_dailyDDPct)
+           {
+            m_dailyDDBlocked = true;
+            LogWarn("PropProtection", StringFormat("DAILY DD BLOCKED! DD=%.2f%% >= %.1f%%", dailyDDNow, m_dailyDDPct));
+            if(m_useEmergencyClose) EmergencyCloseAll("DAILY DD");
+           }
+        }
+
+      // Profit lock
+      if(m_useProfitLock && !m_profitLocked)
+        {
+         double dailyProfitPct = (m_dayStartEquity > 0) ? (equity - m_dayStartEquity) / m_dayStartEquity * 100.0 : 0;
+         if(dailyProfitPct >= m_profitLockPct)
+           {
+            m_profitLocked = true;
+            LogInfo("PropProtection", StringFormat("PROFIT LOCKED at %.2f%% daily gain", dailyProfitPct));
+           }
         }
      }
 
-   //--- Emergency close all positions for this magic number
    void EmergencyCloseAll(const string reason)
      {
-      if(m_state.emergencyClosed) return;
-      LogWarn("PropProtection", "EMERGENCY CLOSE ALL | Reason: " + reason);
-
+      LogError("PropProtection", "EMERGENCY CLOSE ALL | Reason: " + reason);
       for(int i = PositionsTotal() - 1; i >= 0; i--)
         {
          ulong ticket = PositionGetTicket(i);
-         if(ticket == 0) continue;
+         if(!PositionSelectByTicket(ticket)) continue;
          if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if((int)PositionGetInteger(POSITION_MAGIC) != m_magicNumber) continue;
-
-         MqlTradeRequest req  = {};
-         MqlTradeResult  res  = {};
-         req.action    = TRADE_ACTION_DEAL;
-         req.symbol    = m_symbol;
-         req.position  = ticket;
-         req.type      = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-                         ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-         req.volume    = PositionGetDouble(POSITION_VOLUME);
-         req.price     = (req.type == ORDER_TYPE_BUY)
-                         ? SymbolInfoDouble(m_symbol, SYMBOL_ASK)
-                         : SymbolInfoDouble(m_symbol, SYMBOL_BID);
-         req.deviation = 50;
-         req.type_filling = ORDER_FILLING_IOC;
-
-         if(!OrderSend(req, res))
-            LogError("PropProtection", StringFormat(
-               "Close failed ticket=%llu err=%d", ticket, GetLastError()));
-         else
-            LogInfo("PropProtection", StringFormat(
-               "Closed ticket=%llu", ticket));
+         if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) continue;
+         m_trade.PositionClose(ticket);
         }
-
-      m_state.emergencyClosed = true;
      }
 
-   //--- State queries
-   bool IsMaxDDBreached()     const { return m_state.maxDDBreached; }
-   bool IsDailyDDBlocked()    const { return m_state.dailyDDBlocked; }
-   bool IsDailyProfitLocked() const { return m_state.dailyProfitLocked; }
-   bool IsEmergencyClosed()   const { return m_state.emergencyClosed; }
+   bool IsMaxDDBreached()    const { return m_maxDDBreached;  }
+   bool IsDailyDDBlocked()   const { return m_dailyDDBlocked; }
+   bool IsDailyProfitLocked() const { return m_profitLocked;   }
+   bool IsTradingAllowed()   const { return !m_maxDDBreached && !m_dailyDDBlocked && !m_profitLocked; }
 
-   bool IsTradingAllowed() const
-     {
-      return !m_state.maxDDBreached &&
-             !m_state.dailyDDBlocked &&
-             !m_state.dailyProfitLocked &&
-             !m_state.emergencyClosed;
-     }
-
-   //--- Metrics for dashboard
    double GetDailyDDPct() const
      {
-      double dayStart = m_state.dailyStartBalance;
-      if(dayStart == 0) return 0;
       double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-      return (dayStart - equity) / dayStart * 100.0;
+      return (m_dayStartEquity > 0) ? (m_dayStartEquity - equity) / m_dayStartEquity * 100.0 : 0;
      }
-
    double GetMaxDDPct() const
      {
-      if(m_accountStartBalance == 0) return 0;
       double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-      return (m_accountStartBalance - equity) / m_accountStartBalance * 100.0;
+      return (m_startBalance > 0) ? (m_startBalance - equity) / m_startBalance * 100.0 : 0;
      }
-
-   double GetDailyPL() const
-     {
-      return AccountInfoDouble(ACCOUNT_EQUITY) - m_state.dailyStartBalance;
-     }
-
-   double GetDailyPLPct() const
-     {
-      if(m_state.dailyStartBalance == 0) return 0;
-      return GetDailyPL() / m_state.dailyStartBalance * 100.0;
-     }
+   double GetDailyPL() const { return m_dayPL; }
 
    string GetStatusString() const
      {
-      if(m_state.maxDDBreached)   return "MAX DD HIT";
-      if(m_state.emergencyClosed) return "EMERGENCY";
-      if(m_state.dailyDDBlocked)  return "DAILY DD HIT";
-      if(m_state.dailyProfitLocked) return "PROFIT LOCK";
-      return "ACTIVE";
+      if(m_maxDDBreached)  return "MAX DD HIT";
+      if(m_dailyDDBlocked) return "DAILY BLOCKED";
+      if(m_profitLocked)   return "PROFIT LOCKED";
+      return "OK";
      }
   };
-//+------------------------------------------------------------------+
+
 #endif // PROPPROTECTION_MQH

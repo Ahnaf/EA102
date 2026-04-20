@@ -1,208 +1,118 @@
-﻿//+------------------------------------------------------------------+
-//|                                                 SessionFilter.mqh|
-//|                          EA102 - XAUUSD Prop Firm EA             |
-//|             Trading session filter (London / New York / etc.)    |
+//+------------------------------------------------------------------+
+//|                                                SessionFilter.mqh |
+//|                        EA102 v2 - XAUUSD Prop Firm EA            |
+//|                      Trading session window management           |
 //+------------------------------------------------------------------+
 #ifndef SESSIONFILTER_MQH
 #define SESSIONFILTER_MQH
-#include "Utilities.mqh"
 
-//+------------------------------------------------------------------+
-//| Session definition                                               |
-//+------------------------------------------------------------------+
+#include "Utilities.mqh"
+#include <Trade\Trade.mqh>
+
 struct SessionDef
   {
-   string name;
-   int    startHour;   // UTC / server hour (24h)
-   int    startMin;
-   int    endHour;
-   int    endMin;
    bool   enabled;
+   int    startHour;   // UTC
+   int    endHour;     // UTC
+   string name;
   };
 
 //+------------------------------------------------------------------+
-//| CSessionFilter class                                             |
+//| CSessionFilter — controls which hours EA may trade              |
 //+------------------------------------------------------------------+
 class CSessionFilter
   {
 private:
-   SessionDef   m_sessions[4];   // Up to 4 configurable sessions
-   int          m_sessionCount;
-   bool         m_closeTradesOutsideSession;
-   string       m_symbol;
-   int          m_magicNumber;
-   bool         m_filterEnabled;
+   bool       m_filterEnabled;
+   bool       m_closeOutside;
+   string     m_symbol;
+   int        m_magic;
+   SessionDef m_sessions[3];   // London, NY, Asian
+   CTrade     m_trade;
 
 public:
-   CSessionFilter() : m_sessionCount(0), m_filterEnabled(true), m_closeTradesOutsideSession(false) {}
-   ~CSessionFilter() {}
+   CSessionFilter() : m_filterEnabled(true), m_closeOutside(false) {}
 
-   //--- Initialise sessions
-   bool Init(const string symbol,
-             int    magicNumber,
-             bool   filterEnabled,
-             bool   closeOutside,
-             // London
-             bool   useLondon,
-             int    londonStart,   // hour
-             int    londonEnd,     // hour
-             // New York
-             bool   useNewYork,
-             int    nyStart,
-             int    nyEnd,
-             // Asian (optional)
-             bool   useAsian,
-             int    asianStart,
-             int    asianEnd)
+   bool Init(const string symbol, int magic,
+             bool filterEnabled, bool closeOutside,
+             bool useLondon,  int londonStart,  int londonEnd,
+             bool useNewYork, int nyStart,      int nyEnd,
+             bool useAsian,   int asianStart,   int asianEnd)
      {
-      m_symbol                    = symbol;
-      m_magicNumber               = magicNumber;
-      m_filterEnabled             = filterEnabled;
-      m_closeTradesOutsideSession = closeOutside;
-      m_sessionCount              = 0;
+      m_symbol        = symbol;
+      m_magic         = magic;
+      m_filterEnabled = filterEnabled;
+      m_closeOutside  = closeOutside;
+      m_trade.SetExpertMagicNumber(magic);
 
-      if(useLondon)
-        {
-         m_sessions[m_sessionCount].name      = "London";
-         m_sessions[m_sessionCount].startHour = londonStart;
-         m_sessions[m_sessionCount].startMin  = 0;
-         m_sessions[m_sessionCount].endHour   = londonEnd;
-         m_sessions[m_sessionCount].endMin    = 0;
-         m_sessions[m_sessionCount].enabled   = true;
-         m_sessionCount++;
-        }
+      m_sessions[0].enabled   = useLondon;
+      m_sessions[0].startHour = londonStart;
+      m_sessions[0].endHour   = londonEnd;
+      m_sessions[0].name      = "London";
 
-      if(useNewYork)
-        {
-         m_sessions[m_sessionCount].name      = "New York";
-         m_sessions[m_sessionCount].startHour = nyStart;
-         m_sessions[m_sessionCount].startMin  = 0;
-         m_sessions[m_sessionCount].endHour   = nyEnd;
-         m_sessions[m_sessionCount].endMin    = 0;
-         m_sessions[m_sessionCount].enabled   = true;
-         m_sessionCount++;
-        }
+      m_sessions[1].enabled   = useNewYork;
+      m_sessions[1].startHour = nyStart;
+      m_sessions[1].endHour   = nyEnd;
+      m_sessions[1].name      = "New York";
 
-      if(useAsian)
-        {
-         m_sessions[m_sessionCount].name      = "Asian";
-         m_sessions[m_sessionCount].startHour = asianStart;
-         m_sessions[m_sessionCount].startMin  = 0;
-         m_sessions[m_sessionCount].endHour   = asianEnd;
-         m_sessions[m_sessionCount].endMin    = 0;
-         m_sessions[m_sessionCount].enabled   = true;
-         m_sessionCount++;
-        }
+      m_sessions[2].enabled   = useAsian;
+      m_sessions[2].startHour = asianStart;
+      m_sessions[2].endHour   = asianEnd;
+      m_sessions[2].name      = "Asian";
 
-      if(!m_filterEnabled)
-         LogInfo("SessionFilter", "Session filter DISABLED — trading all hours");
-      else
-         LogInfo("SessionFilter", StringFormat("Session filter ON | %d sessions", m_sessionCount));
-
+      LogInfo("SessionFilter", StringFormat("Init | Filter=%s London=%s NY=%s Asian=%s",
+              filterEnabled?"ON":"OFF",
+              useLondon?"ON":"OFF", useNewYork?"ON":"OFF", useAsian?"ON":"OFF"));
       return true;
      }
 
-   //--- Check if current server time is in any active session
    bool IsInSession() const
      {
       if(!m_filterEnabled) return true;
-      if(m_sessionCount == 0) return true;   // No sessions configured = always allow
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      int h = dt.hour;
 
-      MqlDateTime mdt;
-      TimeToStruct(TimeCurrent(), mdt);
-      int nowMinutes = mdt.hour * 60 + mdt.min;
-
-      for(int i = 0; i < m_sessionCount; i++)
+      for(int i = 0; i < 3; i++)
         {
          if(!m_sessions[i].enabled) continue;
-
-         int startMin = m_sessions[i].startHour * 60 + m_sessions[i].startMin;
-         int endMin   = m_sessions[i].endHour   * 60 + m_sessions[i].endMin;
-
-         bool inSession = false;
-         if(startMin < endMin)
-           {
-            // Normal range (e.g., 08:00–17:00)
-            inSession = (nowMinutes >= startMin && nowMinutes < endMin);
-           }
-         else
-           {
-            // Overnight range (e.g., 22:00–06:00)
-            inSession = (nowMinutes >= startMin || nowMinutes < endMin);
-           }
-
-         if(inSession) return true;
+         int s = m_sessions[i].startHour;
+         int e = m_sessions[i].endHour;
+         if(s < e) { if(h >= s && h < e) return true; }
+         else       { if(h >= s || h < e) return true; } // wraps midnight
         }
-
       return false;
      }
 
-   //--- Return the name of active session (or "None")
    string GetActiveSessionName() const
      {
-      if(!m_filterEnabled) return "All";
-      if(m_sessionCount == 0) return "All";
-
-      MqlDateTime mdt;
-      TimeToStruct(TimeCurrent(), mdt);
-      int nowMinutes = mdt.hour * 60 + mdt.min;
-
-      for(int i = 0; i < m_sessionCount; i++)
+      if(!m_filterEnabled) return "Any";
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      int h = dt.hour;
+      for(int i = 0; i < 3; i++)
         {
          if(!m_sessions[i].enabled) continue;
-
-         int startMin = m_sessions[i].startHour * 60 + m_sessions[i].startMin;
-         int endMin   = m_sessions[i].endHour   * 60 + m_sessions[i].endMin;
-
-         bool inSession = false;
-         if(startMin < endMin)
-            inSession = (nowMinutes >= startMin && nowMinutes < endMin);
-         else
-            inSession = (nowMinutes >= startMin || nowMinutes < endMin);
-
-         if(inSession) return m_sessions[i].name;
+         int s = m_sessions[i].startHour;
+         int e = m_sessions[i].endHour;
+         bool inS = (s < e) ? (h >= s && h < e) : (h >= s || h < e);
+         if(inS) return m_sessions[i].name;
         }
-
       return "None";
      }
 
-   //--- If configured, close all positions outside session
    void CloseTradesOutsideSession()
      {
-      if(!m_closeTradesOutsideSession) return;
-      if(IsInSession()) return;
-
+      if(!m_closeOutside || IsInSession()) return;
       for(int i = PositionsTotal() - 1; i >= 0; i--)
         {
          ulong ticket = PositionGetTicket(i);
-         if(ticket == 0) continue;
+         if(!PositionSelectByTicket(ticket)) continue;
          if(PositionGetString(POSITION_SYMBOL) != m_symbol) continue;
-         if((int)PositionGetInteger(POSITION_MAGIC) != m_magicNumber) continue;
-
-         MqlTradeRequest req = {};
-         MqlTradeResult  res = {};
-         req.action    = TRADE_ACTION_DEAL;
-         req.symbol    = m_symbol;
-         req.position  = ticket;
-         req.type      = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-                         ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-         req.volume    = PositionGetDouble(POSITION_VOLUME);
-         req.price     = (req.type == ORDER_TYPE_BUY)
-                         ? SymbolInfoDouble(m_symbol, SYMBOL_ASK)
-                         : SymbolInfoDouble(m_symbol, SYMBOL_BID);
-         req.deviation = 50;
-         req.type_filling = ORDER_FILLING_IOC;
-
-         if(!OrderSend(req, res))
-            LogError("SessionFilter", StringFormat(
-               "Close outside session failed ticket=%llu err=%d", ticket, GetLastError()));
-         else
-            LogInfo("SessionFilter", StringFormat(
-               "Closed outside session ticket=%llu", ticket));
+         if((int)PositionGetInteger(POSITION_MAGIC) != m_magic) continue;
+         m_trade.PositionClose(ticket);
         }
      }
-
-   bool IsFilterEnabled() const { return m_filterEnabled; }
   };
-//+------------------------------------------------------------------+
+
 #endif // SESSIONFILTER_MQH

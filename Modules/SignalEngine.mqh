@@ -1,289 +1,292 @@
 //+------------------------------------------------------------------+
-//|                                                 SignalEngine.mqh |
-//|                          EA102 - XAUUSD Prop Firm EA             |
-//|         HTF Trend Analysis: EMA, Market Structure, RSI           |
+//|                                                SignalEngine.mqh  |
+//|                        EA102 v2 - XAUUSD Prop Firm EA            |
+//| DUAL ENGINE: Continuation + Reversal (independent score-based)  |
 //+------------------------------------------------------------------+
 #ifndef SIGNALENGINE_MQH
 #define SIGNALENGINE_MQH
+
 #include "Utilities.mqh"
 #include "MarketStructure.mqh"
 
-//--- Trade frequency / confirmation mode
-enum ENUM_TRADE_MODE
-  {
-   TRADE_MODE_SAFE       = 0,   // Strictest — requires full confluence
-   TRADE_MODE_NORMAL     = 1,   // Balanced
-   TRADE_MODE_AGGRESSIVE = 2,   // Relaxed — fewer confluences required
-  };
-
-//--- Signal direction
-enum ENUM_SIGNAL_DIR
-  {
-   SIGNAL_NONE  = 0,
-   SIGNAL_BUY   = 1,
-   SIGNAL_SELL  = 2,
-  };
-
-//--- Full signal package returned to MainEA
-struct SignalPackage
+//--- Continuation signal result
+struct ContinuationSignal
   {
    ENUM_SIGNAL_DIR direction;
-   double         setupScore;   // 0.0 – 1.0 (confluence score)
-   string         reason;
-   double         suggestedSL;  // 0 = not set
-   double         suggestedTP;  // 0 = not set
+   double          score;       // 0.0 – 1.0
+   string          reason;
+  };
+
+//--- Reversal signal result
+struct ReversalSignal
+  {
+   ENUM_SIGNAL_DIR direction;
+   double          score;       // 0.0 – 1.0
+   string          reason;
+   bool            liqSweep;   // Triggered by liquidity sweep?
+   bool            choch;      // Change of character confirmed?
   };
 
 //+------------------------------------------------------------------+
-//| CSignalEngine class — evaluates conditions T + U                 |
+//| CSignalEngine — dual engine                                     |
 //+------------------------------------------------------------------+
 class CSignalEngine
   {
 private:
-   string              m_symbol;
-   ENUM_TIMEFRAMES     m_htfTF;       // Higher timeframe for trend (e.g. H1/H4)
-   ENUM_TIMEFRAMES     m_setupTF;     // Setup timeframe (e.g. M15)
+   string            m_symbol;
+   ENUM_TIMEFRAMES   m_htfTF;       // H1 — trend reference
+   ENUM_TIMEFRAMES   m_setupTF;     // M15 — setup reference
+   int               m_emaFast;
+   int               m_emaSlow;
+   int               m_rsiPeriod;
+   ENUM_TRADE_MODE   m_tradeMode;
+   CMarketStructure *m_htfMS;
+   CMarketStructure *m_setupMS;
 
-   // EMA parameters
-   int                 m_emaFastPeriod;
-   int                 m_emaSlowPeriod;
+   //--- Score weights (continuation)
+   static const double W_HTF_EMA       = 0.20;
+   static const double W_HTF_STRUC     = 0.20;
+   static const double W_OB            = 0.25;
+   static const double W_FVG           = 0.12;
+   static const double W_RSI           = 0.12;
+   static const double W_CANDLE        = 0.11;
 
-   // RSI parameters
-   int                 m_rsiPeriod;
-   double              m_rsiBullMin;   // e.g. 50
-   double              m_rsiBullMax;   // e.g. 70
-   double              m_rsiBearMin;   // e.g. 30
-   double              m_rsiBearMax;   // e.g. 50
+   //--- Score weights (reversal)
+   static const double WR_LIQSWEEP     = 0.30;
+   static const double WR_CHOCH        = 0.25;
+   static const double WR_CANDLE       = 0.20;
+   static const double WR_RSI          = 0.15;
+   static const double WR_ATR_EXP      = 0.10;
 
-   // Trade mode
-   ENUM_TRADE_MODE     m_tradeMode;
+   //--- Internal: strong bullish/bearish candle check
+   bool IsStrongBullCandle(ENUM_TIMEFRAMES tf, int shift = 1) const
+     {
+      double body  = CandleBody(m_symbol, tf, shift);
+      double range = CandleRange(m_symbol, tf, shift);
+      double atr   = GetATR(m_symbol, tf, 14, shift);
+      if(atr <= 0 || range <= 0) return false;
+      // Bull: bullish candle, body >= 40% ATR, body >= 60% of range
+      return IsBullishCandle(m_symbol, tf, shift)
+          && body >= 0.40 * atr
+          && body >= 0.55 * range;
+     }
 
-   // Cached market structure object (set by owner)
-   CMarketStructure   *m_htfStructure;
-   CMarketStructure   *m_setupStructure;
+   bool IsStrongBearCandle(ENUM_TIMEFRAMES tf, int shift = 1) const
+     {
+      double body  = CandleBody(m_symbol, tf, shift);
+      double range = CandleRange(m_symbol, tf, shift);
+      double atr   = GetATR(m_symbol, tf, 14, shift);
+      if(atr <= 0 || range <= 0) return false;
+      return IsBearishCandle(m_symbol, tf, shift)
+          && body >= 0.40 * atr
+          && body >= 0.55 * range;
+     }
 
-   // State
-   ENUM_SIGNAL_DIR     m_lastTrendDir;
-   double              m_lastScore;
+   //--- Wick rejection: hammer / shooting star
+   bool IsBullishRejection(ENUM_TIMEFRAMES tf, int shift = 1) const
+     {
+      double body  = CandleBody(m_symbol, tf, shift);
+      double lwic  = CandleLowerWick(m_symbol, tf, shift);
+      double range = CandleRange(m_symbol, tf, shift);
+      if(range <= 0) return false;
+      // Lower wick >= 2× body and >= 60% of range → hammer / pin
+      return (lwic >= 2.0 * body) && (lwic >= 0.55 * range);
+     }
+
+   bool IsBearishRejection(ENUM_TIMEFRAMES tf, int shift = 1) const
+     {
+      double body  = CandleBody(m_symbol, tf, shift);
+      double uwic  = CandleUpperWick(m_symbol, tf, shift);
+      double range = CandleRange(m_symbol, tf, shift);
+      if(range <= 0) return false;
+      return (uwic >= 2.0 * body) && (uwic >= 0.55 * range);
+     }
+
+   //--- ATR expansion: current ATR vs recent average
+   bool IsATRExpansion(ENUM_TIMEFRAMES tf, double multiplier = 1.5) const
+     {
+      double atr1 = GetATR(m_symbol, tf, 14, 1);
+      double atr6 = GetATR(m_symbol, tf, 14, 6);  // Average reference
+      if(atr6 <= 0) return false;
+      return atr1 >= multiplier * atr6;
+     }
 
 public:
-   CSignalEngine() : m_lastTrendDir(SIGNAL_NONE), m_lastScore(0),
-                     m_htfStructure(NULL), m_setupStructure(NULL) {}
-   ~CSignalEngine() {}
+   CSignalEngine() : m_htfMS(NULL), m_setupMS(NULL) {}
 
-   bool Init(const string       symbol,
-             ENUM_TIMEFRAMES    htfTF,
-             ENUM_TIMEFRAMES    setupTF,
-             int                emaFast,
-             int                emaSlow,
-             int                rsiPeriod,
-             double             rsiBullMin,
-             double             rsiBullMax,
-             double             rsiBearMin,
-             double             rsiBearMax,
-             ENUM_TRADE_MODE    tradeMode,
-             CMarketStructure  *htfStructure,
-             CMarketStructure  *setupStructure)
+   bool Init(const string symbol,
+             ENUM_TIMEFRAMES htfTF, ENUM_TIMEFRAMES setupTF,
+             int emaFast, int emaSlow, int rsiPeriod,
+             ENUM_TRADE_MODE tradeMode,
+             CMarketStructure *htfMS, CMarketStructure *setupMS)
      {
-      m_symbol         = symbol;
-      m_htfTF          = htfTF;
-      m_setupTF        = setupTF;
-      m_emaFastPeriod  = emaFast;
-      m_emaSlowPeriod  = emaSlow;
-      m_rsiPeriod      = rsiPeriod;
-      m_rsiBullMin     = rsiBullMin;
-      m_rsiBullMax     = rsiBullMax;
-      m_rsiBearMin     = rsiBearMin;
-      m_rsiBearMax     = rsiBearMax;
-      m_tradeMode      = tradeMode;
-      m_htfStructure   = htfStructure;
-      m_setupStructure = setupStructure;
-
-      LogInfo("SignalEngine", StringFormat(
-         "Init | HTF=%s Setup=%s EMA%d/%d RSI%d Mode=%s",
-         EnumToString(htfTF), EnumToString(setupTF),
-         emaFast, emaSlow, rsiPeriod, EnumToString(tradeMode)));
+      m_symbol    = symbol;
+      m_htfTF     = htfTF;
+      m_setupTF   = setupTF;
+      m_emaFast   = emaFast;
+      m_emaSlow   = emaSlow;
+      m_rsiPeriod = rsiPeriod;
+      m_tradeMode = tradeMode;
+      m_htfMS     = htfMS;
+      m_setupMS   = setupMS;
+      LogInfo("SignalEngine", StringFormat("Init | HTF=%s Setup=%s EMA=%d/%d RSI=%d Mode=%s",
+              EnumToString(htfTF), EnumToString(setupTF), emaFast, emaSlow, rsiPeriod,
+              EnumToString(tradeMode)));
       return true;
      }
 
-   //--- Evaluate full T + U conditions and return signal
-   SignalPackage Evaluate()
+   void SetTradeMode(ENUM_TRADE_MODE mode) { m_tradeMode = mode; }
+
+   //+------------------------------------------------------------------+
+   //| ENGINE 1: Continuation (trend-following, score-based)           |
+   //| Returns score for the given direction. Call for BUY and SELL,   |
+   //| take the higher one (or the one matching HTF trend).            |
+   //+------------------------------------------------------------------+
+   ContinuationSignal GetContinuationSignal(ENUM_SIGNAL_DIR dir) const
      {
-      SignalPackage pkg;
-      pkg.direction   = SIGNAL_NONE;
-      pkg.setupScore  = 0.0;
-      pkg.reason      = "";
-      pkg.suggestedSL = 0;
-      pkg.suggestedTP = 0;
+      ContinuationSignal sig;
+      sig.direction = dir;
+      sig.score     = 0;
+      sig.reason    = "";
 
-      // ===== T: Higher Timeframe Trend =====
-      bool htfBull = false, htfBear = false;
-      double trendScore = EvaluateHTFTrend(htfBull, htfBear);
+      if(dir == SIGNAL_NONE || m_htfMS == NULL || m_setupMS == NULL)
+         return sig;
 
-      if(!htfBull && !htfBear)
-        {
-         pkg.reason = "No HTF trend";
-         return pkg;
-        }
+      double price = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+      string rstr  = "";
+      double sc    = 0;
 
-      // ===== U: Setup on setup TF =====
-      bool setupBull = false, setupBear = false;
-      double setupScore = EvaluateSetup(setupBull, setupBear);
+      //--- 1. HTF EMA alignment (W=0.20)
+      double emaFast = GetEMA(m_symbol, m_htfTF, m_emaFast, 1);
+      double emaSlow = GetEMA(m_symbol, m_htfTF, m_emaSlow, 1);
+      if(dir == SIGNAL_BUY  && emaFast > emaSlow) { sc += W_HTF_EMA; rstr += "EMA↑ "; }
+      if(dir == SIGNAL_SELL && emaFast < emaSlow) { sc += W_HTF_EMA; rstr += "EMA↓ "; }
+      // Partial credit: price above/below slow EMA
+      double ema50pct = W_HTF_EMA * 0.5;
+      if(dir == SIGNAL_BUY  && price > emaSlow && emaFast <= emaSlow) { sc += ema50pct; rstr += "EMA½↑ "; }
+      if(dir == SIGNAL_SELL && price < emaSlow && emaFast >= emaSlow) { sc += ema50pct; rstr += "EMA½↓ "; }
 
-      // Apply trade mode minimum score
-      double minScore = GetMinScore();
+      //--- 2. HTF Structure BOS (W=0.20)
+      if(dir == SIGNAL_BUY  && m_htfMS.HasBOSBull()) { sc += W_HTF_STRUC; rstr += "HTF-BOS↑ "; }
+      if(dir == SIGNAL_SELL && m_htfMS.HasBOSBear()) { sc += W_HTF_STRUC; rstr += "HTF-BOS↓ "; }
+      // Partial: bullish/bearish structure maintained
+      if(dir == SIGNAL_BUY  && m_htfMS.HasBullishStructure() && !m_htfMS.HasBOSBull())  { sc += W_HTF_STRUC * 0.5; rstr += "HTFStrc↑ "; }
+      if(dir == SIGNAL_SELL && m_htfMS.HasBearishStructure() && !m_htfMS.HasBOSBear())  { sc += W_HTF_STRUC * 0.5; rstr += "HTFStrc↓ "; }
 
-      if(htfBull && setupBull && setupScore >= minScore)
-        {
-         pkg.direction  = SIGNAL_BUY;
-         pkg.setupScore = (trendScore + setupScore) / 2.0;
-         pkg.reason     = StringFormat("HTF Bull + Setup Bull (score=%.2f)", pkg.setupScore);
-        }
-      else if(htfBear && setupBear && setupScore >= minScore)
-        {
-         pkg.direction  = SIGNAL_SELL;
-         pkg.setupScore = (trendScore + setupScore) / 2.0;
-         pkg.reason     = StringFormat("HTF Bear + Setup Bear (score=%.2f)", pkg.setupScore);
-        }
-      else
-        {
-         pkg.reason = StringFormat(
-            "Trend/Setup mismatch or score too low (trend=%.2f setup=%.2f min=%.2f)",
-            trendScore, setupScore, minScore);
-        }
+      //--- 3. M15 Price in Order Block (W=0.25)
+      if(dir == SIGNAL_BUY  && m_setupMS.IsPriceInBullishOB(price)) { sc += W_OB; rstr += "inBullOB "; }
+      if(dir == SIGNAL_SELL && m_setupMS.IsPriceInBearishOB(price)) { sc += W_OB; rstr += "inBearOB "; }
 
-      m_lastTrendDir = pkg.direction;
-      m_lastScore    = pkg.setupScore;
+      //--- 4. M15 Price in FVG (W=0.12)
+      if(dir == SIGNAL_BUY  && m_setupMS.IsPriceInBullFVG(price)) { sc += W_FVG; rstr += "inFVG↑ "; }
+      if(dir == SIGNAL_SELL && m_setupMS.IsPriceInBearFVG(price)) { sc += W_FVG; rstr += "inFVG↓ "; }
 
-      if(pkg.direction != SIGNAL_NONE)
-         LogDebug("SignalEngine", pkg.reason);
+      //--- 5. RSI momentum (W=0.12)
+      double rsi = GetRSI(m_symbol, m_htfTF, m_rsiPeriod, 1);
+      if(dir == SIGNAL_BUY  && rsi > 50 && rsi < 70) { sc += W_RSI; rstr += "RSI↑ "; }
+      if(dir == SIGNAL_SELL && rsi < 50 && rsi > 30) { sc += W_RSI; rstr += "RSI↓ "; }
 
-      return pkg;
+      //--- 6. M15 Setup candle strength (W=0.11)
+      if(dir == SIGNAL_BUY  && IsStrongBullCandle(m_setupTF, 1)) { sc += W_CANDLE; rstr += "SBull "; }
+      if(dir == SIGNAL_SELL && IsStrongBearCandle(m_setupTF, 1)) { sc += W_CANDLE; rstr += "SBear "; }
+
+      sig.score  = Clamp(sc, 0, 1.0);
+      sig.reason = rstr;
+      return sig;
      }
 
-   //--- Trade mode setter (can be updated during runtime)
-   void SetTradeMode(ENUM_TRADE_MODE mode)
+   //+------------------------------------------------------------------+
+   //| ENGINE 2: Reversal (counter-trend, liquidity + exhaustion)      |
+   //| Independently scores BOTH directions and returns the best one.  |
+   //| Fires even when HTF trend shows old bias.                       |
+   //+------------------------------------------------------------------+
+   ReversalSignal GetReversalSignal() const
      {
-      m_tradeMode = mode;
-      LogInfo("SignalEngine", StringFormat("TradeMode set to %s", EnumToString(mode)));
+      ReversalSignal sig;
+      sig.direction = SIGNAL_NONE;
+      sig.score     = 0;
+      sig.reason    = "";
+      sig.liqSweep  = false;
+      sig.choch     = false;
+
+      if(m_setupMS == NULL) return sig;
+
+      double scBull = 0, scBear = 0;
+      string rBull = "", rBear = "";
+      bool   lsBull = false, lsBear = false;
+      bool   chBull = false, chBear = false;
+
+      //--- 1. Liquidity Sweep (W=0.30) — strongest reversal signal
+      if(m_setupMS.IsLiquiditySweepBull()) { scBull += WR_LIQSWEEP; rBull += "LiqSwp↑ "; lsBull = true; }
+      if(m_setupMS.IsLiquiditySweepBear()) { scBear += WR_LIQSWEEP; rBear += "LiqSwp↓ "; lsBear = true; }
+      // Also check HTF liquidity sweeps
+      if(m_htfMS != NULL)
+        {
+         if(m_htfMS.IsLiquiditySweepBull() && scBull < WR_LIQSWEEP) { scBull += WR_LIQSWEEP * 0.6; rBull += "HTFSwp↑ "; }
+         if(m_htfMS.IsLiquiditySweepBear() && scBear < WR_LIQSWEEP) { scBear += WR_LIQSWEEP * 0.6; rBear += "HTFSwp↓ "; }
+        }
+
+      //--- 2. CHOCH — change of character (W=0.25)
+      if(m_setupMS.HasCHOCHBull()) { scBull += WR_CHOCH; rBull += "CHOCH↑ "; chBull = true; }
+      if(m_setupMS.HasCHOCHBear()) { scBear += WR_CHOCH; rBear += "CHOCH↓ "; chBear = true; }
+
+      //--- 3. Candle: strong engulfing or wick rejection (W=0.20)
+      // Check M15 and entry TF candles
+      bool strongBull = IsStrongBullCandle(m_setupTF, 1) || IsBullishRejection(m_setupTF, 1)
+                     || IsStrongBullCandle(m_setupTF, 2) || IsBullishRejection(m_setupTF, 2);
+      bool strongBear = IsStrongBearCandle(m_setupTF, 1) || IsBearishRejection(m_setupTF, 1)
+                     || IsStrongBearCandle(m_setupTF, 2) || IsBearishRejection(m_setupTF, 2);
+
+      if(strongBull) { scBull += WR_CANDLE; rBull += "StrongCandle↑ "; }
+      if(strongBear) { scBear += WR_CANDLE; rBear += "StrongCandle↓ "; }
+
+      //--- 4. RSI extreme / momentum flip (W=0.15)
+      double rsiSetup = GetRSI(m_symbol, m_setupTF, m_rsiPeriod, 1);
+      double rsiPrev  = GetRSI(m_symbol, m_setupTF, m_rsiPeriod, 3);  // 3 bars ago
+
+      // Bull reversal: was oversold, now recovering
+      if(rsiSetup < 35 || (rsiPrev < 30 && rsiSetup > rsiPrev))
+        { scBull += WR_RSI; rBull += "RSI-OS "; }
+      // Bear reversal: was overbought, now falling
+      if(rsiSetup > 65 || (rsiPrev > 70 && rsiSetup < rsiPrev))
+        { scBear += WR_RSI; rBear += "RSI-OB "; }
+
+      //--- 5. ATR expansion spike (W=0.10)
+      if(IsATRExpansion(m_setupTF, 1.5))
+        {
+         // Direction of spike by the strongly expanding candle's bias
+         if(IsBullishCandle(m_symbol, m_setupTF, 1)) { scBull += WR_ATR_EXP; rBull += "ATR-Exp↑ "; }
+         else                                         { scBear += WR_ATR_EXP; rBear += "ATR-Exp↓ "; }
+        }
+
+      // Pick winning direction
+      scBull = Clamp(scBull, 0, 1.0);
+      scBear = Clamp(scBear, 0, 1.0);
+
+      if(scBull >= scBear && scBull > 0)
+        {
+         sig.direction = SIGNAL_BUY;
+         sig.score     = scBull;
+         sig.reason    = rBull;
+         sig.liqSweep  = lsBull;
+         sig.choch     = chBull;
+        }
+      else if(scBear > scBull && scBear > 0)
+        {
+         sig.direction = SIGNAL_SELL;
+         sig.score     = scBear;
+         sig.reason    = rBear;
+         sig.liqSweep  = lsBear;
+         sig.choch     = chBear;
+        }
+
+      return sig;
      }
 
-   ENUM_SIGNAL_DIR GetLastTrendDir() const { return m_lastTrendDir; }
-   double          GetLastScore()    const { return m_lastScore; }
-
-private:
-   //--- Evaluate HTF trend: EMAs + market structure + RSI
-   //--- Returns score 0..1
-   double EvaluateHTFTrend(bool &isBull, bool &isBear)
-     {
-      isBull = false;
-      isBear = false;
-
-      double emaFast = GetEMA(m_symbol, m_htfTF, m_emaFastPeriod, 1);
-      double emaSlow = GetEMA(m_symbol, m_htfTF, m_emaSlowPeriod, 1);
-      double rsi     = GetRSI(m_symbol, m_htfTF, m_rsiPeriod, 1);
-      double close   = iClose(m_symbol, m_htfTF, 1);
-
-      double score = 0.0;
-
-      // EMA cross (weight 0.4)
-      if(emaFast > emaSlow) score += 0.4;
-      else if(emaFast < emaSlow) score -= 0.4;
-
-      // Price vs EMA (weight 0.2)
-      if(close > emaSlow) score += 0.2;
-      else if(close < emaSlow) score -= 0.2;
-
-      // RSI (weight 0.2)
-      if(rsi > m_rsiBullMin && rsi < m_rsiBullMax) score += 0.2;
-      else if(rsi < m_rsiBearMax && rsi > m_rsiBearMin) score -= 0.2;
-
-      // Market structure (weight 0.2)
-      if(m_htfStructure != NULL)
-        {
-         if(m_htfStructure->HasBullishSetup()) score += 0.2;
-         else if(m_htfStructure->HasBearishSetup()) score -= 0.2;
-        }
-
-      double bullThreshold = GetBullThreshold();
-      double bearThreshold = -GetBullThreshold();   // symmetric
-
-      if(score >= bullThreshold)
-        {
-         isBull = true;
-         return score;
-        }
-      if(score <= bearThreshold)
-        {
-         isBear = true;
-         return MathAbs(score);
-        }
-
-      return 0.0;
-     }
-
-   //--- Evaluate M15 setup: BOS/CHOCH + OB/FVG
-   double EvaluateSetup(bool &isBull, bool &isBear)
-     {
-      isBull = false;
-      isBear = false;
-
-      if(m_setupStructure == NULL) return 0.0;
-
-      double score    = 0.0;
-      double price    = iClose(m_symbol, m_setupTF, 1);
-
-      ENUM_MS_SIGNAL sig = m_setupStructure->GetLastSignal();
-
-      // BOS/CHOCH
-      if(sig == MS_BOS_BULL || sig == MS_CHOCH_BULL || sig == MS_LIQ_SWEEP_L)
-        {
-         score += 0.4;
-         isBull = true;
-        }
-      else if(sig == MS_BOS_BEAR || sig == MS_CHOCH_BEAR || sig == MS_LIQ_SWEEP_H)
-        {
-         score += 0.4;
-         isBear = true;
-        }
-
-      // OB confluence
-      if(isBull && m_setupStructure->IsPriceInBullishOB(price)) score += 0.3;
-      if(isBear && m_setupStructure->IsPriceInBearishOB(price)) score += 0.3;
-
-      // FVG confluence
-      if(isBull && m_setupStructure->IsPriceInBullFVG(price)) score += 0.3;
-      if(isBear && m_setupStructure->IsPriceInBearFVG(price)) score += 0.3;
-
-      // Normalise
-      score = MathMin(score, 1.0);
-
-      return score;
-     }
-
-   //--- Minimum required setup score per trade mode
-   double GetMinScore() const
-     {
-      switch(m_tradeMode)
-        {
-         case TRADE_MODE_SAFE:       return 0.75;
-         case TRADE_MODE_NORMAL:     return 0.55;
-         case TRADE_MODE_AGGRESSIVE: return 0.35;
-        }
-      return 0.55;
-     }
-
-   //--- Minimum trend score to confirm trend
-   double GetBullThreshold() const
-     {
-      switch(m_tradeMode)
-        {
-         case TRADE_MODE_SAFE:       return 0.70;
-         case TRADE_MODE_NORMAL:     return 0.50;
-         case TRADE_MODE_AGGRESSIVE: return 0.30;
-        }
-      return 0.50;
-     }
+   //--- Expose last RSI for external use (e.g. ExitManager)
+   double GetSetupRSI() const { return GetRSI(m_symbol, m_setupTF, m_rsiPeriod, 1); }
+   double GetHTF_EMAFast() const { return GetEMA(m_symbol, m_htfTF, m_emaFast, 1); }
+   double GetHTF_EMASlow() const { return GetEMA(m_symbol, m_htfTF, m_emaSlow, 1); }
   };
-//+------------------------------------------------------------------+
+
 #endif // SIGNALENGINE_MQH

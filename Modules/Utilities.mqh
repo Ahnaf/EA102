@@ -1,7 +1,7 @@
-﻿//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
 //|                                                    Utilities.mqh |
-//|                          EA102 - XAUUSD Prop Firm EA             |
-//|                        Shared Utility Functions & Helpers        |
+//|                        EA102 v2 - XAUUSD Prop Firm EA            |
+//|                            Shared Helpers & Enumerations         |
 //+------------------------------------------------------------------+
 #ifndef UTILITIES_MQH
 #define UTILITIES_MQH
@@ -15,79 +15,68 @@ enum ENUM_LOG_LEVEL
    LOG_ERROR   = 3
   };
 
-//--- Global log level (can be controlled via input)
+//--- Trade mode: controls entry aggressiveness and filter thresholds
+enum ENUM_TRADE_MODE
+  {
+   TRADE_MODE_SAFE       = 0,   // Full confirmation required
+   TRADE_MODE_NORMAL     = 1,   // Moderate confirmation
+   TRADE_MODE_AGGRESSIVE = 2    // Early entry after first strong signal
+  };
+
+//--- Direction of trade signal
+enum ENUM_SIGNAL_DIR
+  {
+   SIGNAL_NONE = 0,
+   SIGNAL_BUY  = 1,
+   SIGNAL_SELL = -1
+  };
+
+//--- Which engine generated the trade
+enum ENUM_SIGNAL_TYPE
+  {
+   SIGNAL_TYPE_NONE         = 0,
+   SIGNAL_TYPE_CONTINUATION = 1,   // Trend-following (EMA + BOS + OB/FVG)
+   SIGNAL_TYPE_REVERSAL     = 2,   // Counter-trend  (liq sweep + CHOCH)
+   SIGNAL_TYPE_IMPULSE      = 3    // Momentum spike breakout
+  };
+
+//--- Global log level (set from EA input)
 ENUM_LOG_LEVEL g_LogLevel = LOG_INFO;
 
 //+------------------------------------------------------------------+
-//| Logging helper                                                   |
+//| Logging                                                          |
 //+------------------------------------------------------------------+
 void LogMessage(ENUM_LOG_LEVEL level, const string module, const string msg)
   {
-   if(level < g_LogLevel)
-      return;
-
-   string prefix = "";
+   if(level < g_LogLevel) return;
+   string pfx;
    switch(level)
      {
-      case LOG_DEBUG:   prefix = "[DEBUG]  "; break;
-      case LOG_INFO:    prefix = "[INFO ]  "; break;
-      case LOG_WARNING: prefix = "[WARN ]  "; break;
-      case LOG_ERROR:   prefix = "[ERROR]  "; break;
+      case LOG_DEBUG:   pfx = "[DBG]  "; break;
+      case LOG_INFO:    pfx = "[INFO] "; break;
+      case LOG_WARNING: pfx = "[WARN] "; break;
+      case LOG_ERROR:   pfx = "[ERR]  "; break;
+      default:          pfx = "[LOG]  "; break;
      }
-
-   string fullMsg = prefix + "[" + module + "] " + msg;
-   Print(fullMsg);
+   Print(pfx + "[" + module + "] " + msg);
   }
 
-//+------------------------------------------------------------------+
-//| Shorthand log functions                                          |
-//+------------------------------------------------------------------+
-void LogDebug(const string module, const string msg)   { LogMessage(LOG_DEBUG,   module, msg); }
-void LogInfo(const string module, const string msg)    { LogMessage(LOG_INFO,    module, msg); }
-void LogWarn(const string module, const string msg)    { LogMessage(LOG_WARNING, module, msg); }
-void LogError(const string module, const string msg)   { LogMessage(LOG_ERROR,   module, msg); }
+void LogDebug(const string m, const string s) { LogMessage(LOG_DEBUG,   m, s); }
+void LogInfo (const string m, const string s) { LogMessage(LOG_INFO,    m, s); }
+void LogWarn (const string m, const string s) { LogMessage(LOG_WARNING, m, s); }
+void LogError(const string m, const string s) { LogMessage(LOG_ERROR,   m, s); }
 
 //+------------------------------------------------------------------+
-//| Format double to string with N decimal places                    |
-//+------------------------------------------------------------------+
-string DoubleToStr(double val, int digits = 2)
-  {
-   return DoubleToString(val, digits);
-  }
-
-//+------------------------------------------------------------------+
-//| Get current server time as formatted string                      |
-//+------------------------------------------------------------------+
-string GetTimeString(datetime t = 0)
-  {
-   if(t == 0) t = TimeCurrent();
-   return TimeToString(t, TIME_DATE | TIME_MINUTES);
-  }
-
-//+------------------------------------------------------------------+
-//| Convert minutes to seconds                                       |
-//+------------------------------------------------------------------+
-int MinutesToSeconds(int minutes)
-  {
-   return minutes * 60;
-  }
-
-//+------------------------------------------------------------------+
-//| Get start of current trading day (server time, 00:00)           |
+//| Time helpers                                                     |
 //+------------------------------------------------------------------+
 datetime GetDayStart()
   {
-   MqlDateTime mdt;
-   TimeToStruct(TimeCurrent(), mdt);
-   mdt.hour = 0;
-   mdt.min  = 0;
-   mdt.sec  = 0;
-   return StructToTime(mdt);
+   MqlDateTime d;
+   TimeToStruct(TimeCurrent(), d);
+   d.hour = 0; d.min = 0; d.sec = 0;
+   return StructToTime(d);
   }
 
-//+------------------------------------------------------------------+
-//| Check whether two datetimes fall on the same calendar day       |
-//+------------------------------------------------------------------+
 bool SameDay(datetime t1, datetime t2)
   {
    MqlDateTime d1, d2;
@@ -96,168 +85,140 @@ bool SameDay(datetime t1, datetime t2)
    return (d1.year == d2.year && d1.mon == d2.mon && d1.day == d2.day);
   }
 
-//+------------------------------------------------------------------+
-//| Clamp a double between min and max                               |
-//+------------------------------------------------------------------+
-double Clamp(double val, double minVal, double maxVal)
+string GetTimeString(datetime t = 0)
   {
-   if(val < minVal) return minVal;
-   if(val > maxVal) return maxVal;
+   if(t == 0) t = TimeCurrent();
+   return TimeToString(t, TIME_DATE | TIME_MINUTES);
+  }
+
+//+------------------------------------------------------------------+
+//| Math / price helpers                                             |
+//+------------------------------------------------------------------+
+double Clamp(double val, double lo, double hi)
+  {
+   if(val < lo) return lo;
+   if(val > hi) return hi;
    return val;
   }
 
-//+------------------------------------------------------------------+
-//| Normalise lots to broker specifications                          |
-//+------------------------------------------------------------------+
 double NormalizeLots(const string symbol, double lots)
   {
-   double minLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-   double maxLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-   double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-
-   lots = MathFloor(lots / lotStep) * lotStep;
-   lots = Clamp(lots, minLot, maxLot);
-   return NormalizeDouble(lots, 2);
+   double mn  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double mx  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double stp = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   if(stp <= 0) stp = 0.01;
+   lots = MathFloor(lots / stp) * stp;
+   return Clamp(lots, mn, mx);
   }
 
-//+------------------------------------------------------------------+
-//| Points to price distance for symbol                              |
-//+------------------------------------------------------------------+
-double PointsToPrice(const string symbol, double points)
-  {
-   return points * SymbolInfoDouble(symbol, SYMBOL_POINT);
-  }
-
-//+------------------------------------------------------------------+
-//| Price distance to points for symbol                              |
-//+------------------------------------------------------------------+
-double PriceToPoints(const string symbol, double priceDiff)
+double PriceToPoints(const string symbol, double diff)
   {
    double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   if(pt == 0) return 0;
-   return priceDiff / pt;
+   return (pt > 0) ? diff / pt : 0;
+  }
+
+double PointsToPrice(const string symbol, double pts)
+  {
+   return pts * SymbolInfoDouble(symbol, SYMBOL_POINT);
   }
 
 //+------------------------------------------------------------------+
-//| ATR value helper — returns ATR[shift] on given TF               |
+//| Indicator helpers — on-demand handles (released after use)      |
 //+------------------------------------------------------------------+
 double GetATR(const string symbol, ENUM_TIMEFRAMES tf, int period, int shift = 1)
   {
-   int handle = iATR(symbol, tf, period);
-   if(handle == INVALID_HANDLE)
-     {
-      LogError("Utilities", "Failed to create ATR handle");
-      return 0;
-     }
-
+   int h = iATR(symbol, tf, period);
+   if(h == INVALID_HANDLE) return 0;
    double buf[];
    ArraySetAsSeries(buf, true);
-   if(CopyBuffer(handle, 0, shift, 1, buf) <= 0)
-     {
-      IndicatorRelease(handle);
-      return 0;
-     }
+   double val = 0;
+   if(CopyBuffer(h, 0, shift, 1, buf) > 0) val = buf[0];
+   IndicatorRelease(h);
+   return val;
+  }
 
-   double val = buf[0];
-   IndicatorRelease(handle);
+double GetEMA(const string symbol, ENUM_TIMEFRAMES tf, int period, int shift = 1)
+  {
+   int h = iMA(symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE);
+   if(h == INVALID_HANDLE) return 0;
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   double val = 0;
+   if(CopyBuffer(h, 0, shift, 1, buf) > 0) val = buf[0];
+   IndicatorRelease(h);
+   return val;
+  }
+
+double GetRSI(const string symbol, ENUM_TIMEFRAMES tf, int period, int shift = 1)
+  {
+   int h = iRSI(symbol, tf, period, PRICE_CLOSE);
+   if(h == INVALID_HANDLE) return 50;
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   double val = 50;
+   if(CopyBuffer(h, 0, shift, 1, buf) > 0) val = buf[0];
+   IndicatorRelease(h);
    return val;
   }
 
 //+------------------------------------------------------------------+
-//| Get candle body size in points                                   |
-//+------------------------------------------------------------------+
-double CandleBodyPoints(const string symbol, ENUM_TIMEFRAMES tf, int shift = 1)
-  {
-   double o = iOpen(symbol, tf, shift);
-   double c = iClose(symbol, tf, shift);
-   return MathAbs(PriceToPoints(symbol, MathAbs(c - o)));
-  }
-
-//+------------------------------------------------------------------+
-//| Is candle bullish?                                               |
+//| Candle helpers                                                   |
 //+------------------------------------------------------------------+
 bool IsBullishCandle(const string symbol, ENUM_TIMEFRAMES tf, int shift = 1)
   {
    return iClose(symbol, tf, shift) > iOpen(symbol, tf, shift);
   }
 
-//+------------------------------------------------------------------+
-//| Is candle bearish?                                               |
-//+------------------------------------------------------------------+
 bool IsBearishCandle(const string symbol, ENUM_TIMEFRAMES tf, int shift = 1)
   {
    return iClose(symbol, tf, shift) < iOpen(symbol, tf, shift);
   }
 
-//+------------------------------------------------------------------+
-//| Get RSI value                                                    |
-//+------------------------------------------------------------------+
-double GetRSI(const string symbol, ENUM_TIMEFRAMES tf, int period, int shift = 1)
+double CandleBody(const string symbol, ENUM_TIMEFRAMES tf, int shift = 1)
   {
-   int handle = iRSI(symbol, tf, period, PRICE_CLOSE);
-   if(handle == INVALID_HANDLE) return 50.0;
-
-   double buf[];
-   ArraySetAsSeries(buf, true);
-   if(CopyBuffer(handle, 0, shift, 1, buf) <= 0)
-     {
-      IndicatorRelease(handle);
-      return 50.0;
-     }
-
-   double val = buf[0];
-   IndicatorRelease(handle);
-   return val;
+   return MathAbs(iClose(symbol, tf, shift) - iOpen(symbol, tf, shift));
   }
 
-//+------------------------------------------------------------------+
-//| Get EMA value                                                    |
-//+------------------------------------------------------------------+
-double GetEMA(const string symbol, ENUM_TIMEFRAMES tf, int period, int shift = 1)
+double CandleRange(const string symbol, ENUM_TIMEFRAMES tf, int shift = 1)
   {
-   int handle = iMA(symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE);
-   if(handle == INVALID_HANDLE) return 0.0;
-
-   double buf[];
-   ArraySetAsSeries(buf, true);
-   if(CopyBuffer(handle, 0, shift, 1, buf) <= 0)
-     {
-      IndicatorRelease(handle);
-      return 0.0;
-     }
-
-   double val = buf[0];
-   IndicatorRelease(handle);
-   return val;
+   return iHigh(symbol, tf, shift) - iLow(symbol, tf, shift);
   }
 
-//+------------------------------------------------------------------+
-//| Pip value for current symbol (USD account)                       |
-//+------------------------------------------------------------------+
+double CandleUpperWick(const string symbol, ENUM_TIMEFRAMES tf, int shift = 1)
+  {
+   return iHigh(symbol, tf, shift) - MathMax(iOpen(symbol, tf, shift), iClose(symbol, tf, shift));
+  }
+
+double CandleLowerWick(const string symbol, ENUM_TIMEFRAMES tf, int shift = 1)
+  {
+   return MathMin(iOpen(symbol, tf, shift), iClose(symbol, tf, shift)) - iLow(symbol, tf, shift);
+  }
+
 double GetPipValue(const string symbol)
   {
-   double tickVal  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-   double point    = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   if(tickSize == 0) return 0;
-   return tickVal * point / tickSize;
+   double tv = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(ts == 0) return 0;
+   return tv * pt / ts;
   }
 
-//+------------------------------------------------------------------+
-//| Return human-readable order type string                          |
-//+------------------------------------------------------------------+
-string OrderTypeStr(ENUM_ORDER_TYPE t)
+string SignalDirStr(ENUM_SIGNAL_DIR d)
+  {
+   if(d == SIGNAL_BUY)  return "BUY";
+   if(d == SIGNAL_SELL) return "SELL";
+   return "NONE";
+  }
+
+string SignalTypeStr(ENUM_SIGNAL_TYPE t)
   {
    switch(t)
      {
-      case ORDER_TYPE_BUY:             return "BUY";
-      case ORDER_TYPE_SELL:            return "SELL";
-      case ORDER_TYPE_BUY_LIMIT:       return "BUY_LIMIT";
-      case ORDER_TYPE_SELL_LIMIT:      return "SELL_LIMIT";
-      case ORDER_TYPE_BUY_STOP:        return "BUY_STOP";
-      case ORDER_TYPE_SELL_STOP:       return "SELL_STOP";
-      default:                         return "UNKNOWN";
+      case SIGNAL_TYPE_CONTINUATION: return "CONTINUATION";
+      case SIGNAL_TYPE_REVERSAL:     return "REVERSAL";
+      case SIGNAL_TYPE_IMPULSE:      return "IMPULSE";
+      default:                       return "NONE";
      }
   }
-//+------------------------------------------------------------------+
+
 #endif // UTILITIES_MQH
