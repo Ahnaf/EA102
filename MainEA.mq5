@@ -1,532 +1,532 @@
 //+------------------------------------------------------------------+
-//|                                                     MainEA.mq5   |
-//|                          EA102 — XAUUSD Prop Firm Expert Advisor |
-//|              Full Modular SMC / ICT Strategy with Prop Protection|
-//|                                                                  |
-//|  Decision Gate:                                                  |
-//|    AllowTrade = R AND S AND N AND F AND T AND U AND E AND X      |
-//|  R = Risk protection (DD checks)                                 |
-//|  S = Session allowed                                             |
-//|  N = News filter passed                                          |
-//|  F = Frequency gate passed                                       |
-//|  T = HTF trend valid                                             |
-//|  U = Setup valid (BOS/CHOCH/OB/FVG)                              |
-//|  E = Entry confirmation (candle + momentum)                      |
-//|  X = Exposure allowed                                            |
+//|                                                      MainEA.mq5  |
+//|                        EA102 v2 - XAUUSD Prop Firm EA            |
+//|     Three-Engine Architecture: Continuation + Reversal + Exit   |
 //+------------------------------------------------------------------+
-#property copyright "EA102 - XAUUSD Prop EA"
-#property version   "1.00"
+#property copyright "EA102 v2"
+#property version   "2.00"
 #property strict
 
-//--- Module includes
+//--- Module includes (dependency order)
 #include "Modules/Utilities.mqh"
 #include "Modules/PropProtection.mqh"
 #include "Modules/SessionFilter.mqh"
 #include "Modules/NewsFilter.mqh"
 #include "Modules/MarketStructure.mqh"
 #include "Modules/SignalEngine.mqh"
+#include "Modules/TradeManager.mqh"
 #include "Modules/EntryEngine.mqh"
 #include "Modules/RiskManager.mqh"
-#include "Modules/TradeManager.mqh"
 #include "Modules/ExitManager.mqh"
 #include "Modules/Dashboard.mqh"
 
-//==================================================================//
-//                       INPUT PARAMETERS                           //
-//==================================================================//
+//+------------------------------------------------------------------+
+//|  ═══════════════  INPUT PARAMETERS  ═══════════════             |
+//+------------------------------------------------------------------+
 
-//--- [ General ]
-input group            "═══ General ═══"
-input int              InpMagicNumber      = 102000;       // Magic number
-input string           InpSymbol           = "XAUUSD";     // Symbol
-input string           InpTradeComment     = "EA102";      // Trade comment
-input int              InpSlippage         = 30;           // Slippage (points)
-input ENUM_LOG_LEVEL   InpLogLevel         = LOG_INFO;     // Log level
+//--- Core
+input string          InpSection1        = "── Core ──";
+input int             InpMagicNumber     = 102002;
+input string          InpEAComment       = "EA102v2";
+input ENUM_TRADE_MODE InpTradeMode       = TRADE_MODE_NORMAL;  // SAFE / NORMAL / AGGRESSIVE
+input int             InpSlippage        = 30;
 
-//--- [ Prop Protection ]
-input group            "═══ Prop Protection ═══"
-input double           InpMaxDDPct         = 10.0;         // Max drawdown % (hard stop)
-input double           InpDailyDDPct       = 5.0;          // Daily DD % limit
-input bool             InpUseDailyProfitLock = false;      // Enable daily profit lock
-input double           InpDailyProfitLockPct = 3.0;        // Daily profit lock % target
-input bool             InpUseEmergencyClose  = true;       // Emergency close on breach
+//--- Timeframes
+input string          InpSection2        = "── Timeframes ──";
+input ENUM_TIMEFRAMES InpHTF_TF          = PERIOD_H1;    // Higher timeframe trend (EMAs, structure)
+input ENUM_TIMEFRAMES InpSetupTF         = PERIOD_M15;   // Setup / OB / FVG timeframe
+input ENUM_TIMEFRAMES InpEntryTF         = PERIOD_M5;    // Entry confirmation candle TF
 
-//--- [ Trade Mode ]
-input group            "═══ Trade Mode ═══"
-input ENUM_TRADE_MODE  InpTradeMode        = TRADE_MODE_NORMAL; // Trading mode
+//--- Prop Firm Protection (R = Risk gate)
+input string          InpSection3        = "── Prop Protection ──";
+input double          InpMaxDDPct        = 9.0;          // Hard max drawdown %
+input double          InpDailyDDPct      = 4.5;          // Daily drawdown limit %
+input bool            InpUseProfitLock   = true;
+input double          InpProfitLockPct   = 4.0;          // Lock profit after this daily gain %
+input bool            InpEmergencyClose  = true;
 
-//--- [ Session Filter ]
-input group            "═══ Session Filter ═══"
-input bool             InpSessionFilterOn  = true;         // Enable session filter
-input bool             InpCloseOutsideSession = false;     // Close trades outside session
-input bool             InpUseLondon        = true;         // Enable London session
-input int              InpLondonStart      = 7;            // London start hour (UTC)
-input int              InpLondonEnd        = 16;           // London end hour (UTC)
-input bool             InpUseNewYork       = true;         // Enable New York session
-input int              InpNYStart          = 12;           // NY start hour (UTC)
-input int              InpNYEnd            = 20;           // NY end hour (UTC)
-input bool             InpUseAsian         = false;        // Enable Asian session
-input int              InpAsianStart       = 0;            // Asian start hour (UTC)
-input int              InpAsianEnd         = 6;            // Asian end hour (UTC)
+//--- Session (S gate)
+input string          InpSection4        = "── Session Filter ──";
+input bool            InpUseSession      = true;
+input bool            InpSessionClose    = false;
+input bool            InpUseLondon       = true;
+input int             InpLondonStart     = 7;
+input int             InpLondonEnd       = 15;
+input bool            InpUseNewYork      = true;
+input int             InpNYStart         = 13;
+input int             InpNYEnd           = 20;
+input bool            InpUseAsian        = false;
+input int             InpAsianStart      = 0;
+input int             InpAsianEnd        = 5;
 
-//--- [ News Filter ]
-input group            "═══ News Filter ═══"
-input bool             InpNewsFilterOn     = true;         // Enable news filter
-input int              InpNewsMinsB4       = 30;           // Minutes before news to block
-input int              InpNewsMinsAfter    = 15;           // Minutes after news to unblock
-input bool             InpAutoBlockNFP     = true;         // Auto-block NFP Fridays
-input int              InpNFPHour          = 12;           // NFP hour (UTC, e.g. 12 = 12:30)
-input int              InpNFPWindowMins    = 60;           // Window ±minutes around NFP
-input bool             InpAutoBlockFOMC    = true;         // Auto-block FOMC
-input int              InpFOMCHour         = 18;           // FOMC announcement hour (UTC)
-// Manual news event 1 (leave blank to disable)
-input string           InpNews1DateTime    = "";           // News event 1: "YYYY.MM.DD HH:MM"
-input string           InpNews1Desc        = "Manual News 1"; // News event 1 description
-// Manual news event 2
-input string           InpNews2DateTime    = "";           // News event 2: "YYYY.MM.DD HH:MM"
-input string           InpNews2Desc        = "Manual News 2"; // News event 2 description
-// Manual news event 3
-input string           InpNews3DateTime    = "";           // News event 3: "YYYY.MM.DD HH:MM"
-input string           InpNews3Desc        = "Manual News 3"; // News event 3 description
+//--- News (N gate)
+input string          InpSection5        = "── News Filter ──";
+input bool            InpUseNews         = true;
+input int             InpNewsMinsBefore  = 30;
+input int             InpNewsMinsAfter   = 20;
+input bool            InpAutoNFP         = true;
+input int             InpNFP_Hour        = 12;
+input int             InpNFP_Window      = 60;
+input bool            InpAutoFOMC        = true;
+input int             InpFOMC_Hour       = 18;
 
-//--- [ Risk Management ]
-input group            "═══ Risk Management ═══"
-input double           InpRiskPct          = 1.0;          // Risk per trade (%)
-input double           InpMaxExposurePct   = 3.0;          // Max total open risk (%)
-input int              InpMaxOpenTrades    = 2;            // Max open trades
-input double           InpMaxSymbolRiskPct = 3.0;          // Max per-symbol risk (%)
-input bool             InpAllowHedge       = false;        // Allow hedge trades
-input int              InpMaxTradesPerDay  = 3;            // Max trades per day (0=unlimited)
-input int              InpMaxTradesPerSess = 2;            // Max trades per session (0=unlimited)
+//--- Signal Engines
+input string          InpSection6        = "── Signal Engines ──";
+input int             InpEMA_Fast        = 21;
+input int             InpEMA_Slow        = 55;
+input int             InpRSI_Period      = 14;
+input double          InpRSI_OB          = 70.0;
+input double          InpRSI_OS          = 30.0;
+input int             InpMS_Lookback     = 40;           // Market structure lookback (bars)
+input int             InpMS_SwingStr     = 3;            // Swing definition strength
+// Score thresholds (auto-adjusted by mode, but can override)
+input double          InpCont_ThreshSafe = 0.70;
+input double          InpCont_ThreshNorm = 0.50;
+input double          InpCont_ThreshAggr = 0.35;
+input double          InpRev_ThreshSafe  = 0.75;
+input double          InpRev_ThreshNorm  = 0.60;
+input double          InpRev_ThreshAggr  = 0.45;
 
-//--- [ Stop Loss ]
-input group            "═══ Stop Loss ═══"
-input int              InpSLMode           = 0;            // SL mode: 0=Structure, 1=ATR
-input double           InpSLAtrMul         = 1.5;          // ATR multiplier for SL
+//--- Entry Engine
+input string          InpSection7        = "── Entry Engine ──";
+input double          InpEngulfRatio     = 1.2;          // Engulfing body ratio
+input int             InpEntry_ATR_Per   = 14;
+input double          InpMinBodyATR      = 0.30;         // Min body as ATR fraction
+input int             InpSL_Mode         = 0;            // 0=Structure, 1=ATR
+input double          InpSL_ATR_Mul      = 1.5;
+input int             InpTP_Mode         = 0;            // 0=FixedRR, 1=Liquidity, 2=Hybrid
+input double          InpRR_Ratio        = 2.0;
 
-//--- [ Take Profit ]
-input group            "═══ Take Profit ═══"
-input int              InpTPMode           = 2;            // TP mode: 0=Fixed RR, 1=Liquidity, 2=Hybrid
-input double           InpRRRatio          = 2.0;          // Risk:Reward ratio
+//--- Risk Manager (F + X gates)
+input string          InpSection8        = "── Risk Manager ──";
+input double          InpRiskPct         = 0.75;         // Risk per trade %
+input double          InpMaxExposurePct  = 3.0;          // Total open risk %
+input int             InpMaxOpenTrades   = 2;
+input bool            InpAllowHedge      = false;
+input int             InpMaxTradesDay    = 6;
+input int             InpMaxTradesSess   = 3;
 
-//--- [ Break-even ]
-input group            "═══ Break-even ═══"
-input bool             InpUseBE            = true;         // Enable break-even
-input double           InpBETriggerR       = 1.0;          // BE trigger (R multiple)
-input double           InpBEBufferPoints   = 30;           // BE buffer above entry (points)
+//--- Exit / Profit Protection Engine
+input string          InpSection9        = "── Exit / Profit Protection ──";
+input bool            InpUseBE           = true;
+input double          InpBE_TriggerR     = 0.9;          // Apply BE when R >= this
+input double          InpBE_BufferPts    = 20;           // Extra buffer (points) above entry
+input bool            InpUsePartial      = true;
+input double          InpPartial_R       = 1.0;          // Partial close trigger R
+input double          InpPartial_Pct     = 0.50;         // Fraction to close (0.5 = 50%)
+input bool            InpUseGiveback     = true;
+input double          InpGiveR1          = 1.5;          // Give-back lower band
+input double          InpGiveDrop1       = 0.6;          // Drop from maxR to trigger
+input double          InpGiveR2          = 2.0;          // Give-back upper band
+input double          InpGiveDrop2       = 0.9;          // Drop from maxR to trigger
+input bool            InpRevExit         = true;
+input double          InpRevExitScore    = 0.55;         // Min reversal score for reversal exit
+input bool            InpUseTrail        = true;
+input int             InpTrail_ATR_Per   = 14;
+input double          InpTrail_ATR_Mul   = 1.8;
 
-//--- [ Partial Close ]
-input group            "═══ Partial Close ═══"
-input bool             InpUsePartialClose  = true;         // Enable partial close
-input double           InpPartialCloseR    = 1.2;          // Partial close trigger (R)
-input double           InpPartialClosePct  = 50.0;         // Partial close % of position
+//--- Dashboard
+input string          InpSection10       = "── Dashboard ──";
+input bool            InpShowDashboard   = true;
+input ENUM_LOG_LEVEL  InpLogLevel        = LOG_INFO;
 
-//--- [ Trailing Stop ]
-input group            "═══ Trailing Stop ═══"
-input bool             InpUseTrailing      = true;         // Enable ATR trailing stop
-input int              InpTrailingAtrPeriod = 14;          // ATR period for trailing
-input double           InpTrailingAtrMul   = 2.0;          // ATR multiplier for trail
+//+------------------------------------------------------------------+
+//|  Global module instances                                         |
+//+------------------------------------------------------------------+
+CPropProtection  g_prop;
+CSessionFilter   g_session;
+CNewsFilter      g_news;
+CMarketStructure g_htfMS;
+CMarketStructure g_setupMS;
+CSignalEngine    g_signal;
+CRiskManager     g_risk;
+CTradeManager    g_trade;
+CEntryEngine     g_entry;
+CExitManager     g_exit;
+CDashboard       g_dash;
 
-//--- [ Signal Engine — HTF Trend ]
-input group            "═══ Signal Engine (HTF Trend) ═══"
-input ENUM_TIMEFRAMES  InpHTFTimeframe     = PERIOD_H1;    // Higher timeframe for trend
-input int              InpEMAFast          = 21;           // EMA fast period
-input int              InpEMASlow          = 55;           // EMA slow period
-input int              InpRSIPeriod        = 14;           // RSI period
-input double           InpRSIBullMin       = 50.0;         // RSI bullish min
-input double           InpRSIBullMax       = 70.0;         // RSI bullish max
-input double           InpRSIBearMin       = 30.0;         // RSI bearish min
-input double           InpRSIBearMax       = 50.0;         // RSI bearish max
+//--- State
+datetime g_lastHTFBar   = 0;
+datetime g_lastSetupBar = 0;
+datetime g_lastEntryBar = 0;
 
-//--- [ Market Structure ]
-input group            "═══ Market Structure ═══"
-input ENUM_TIMEFRAMES  InpSetupTimeframe   = PERIOD_M15;   // Setup timeframe
-input int              InpHTFLookback      = 150;          // HTF structure lookback bars
-input int              InpHTFSwingStr      = 3;            // HTF swing strength
-input int              InpSetupLookback    = 100;          // Setup structure lookback bars
-input int              InpSetupSwingStr    = 2;            // Setup swing strength
+//--- Dashboard data
+double g_contScoreBuy  = 0;
+double g_contScoreSell = 0;
+double g_revScore      = 0;
+ENUM_SIGNAL_DIR  g_revDir       = SIGNAL_NONE;
+ENUM_SIGNAL_TYPE g_lastSigType  = SIGNAL_TYPE_NONE;
 
-//--- [ Entry Engine ]
-input group            "═══ Entry Engine (M5) ═══"
-input ENUM_TIMEFRAMES  InpEntryTimeframe   = PERIOD_M5;    // Entry timeframe
-input int              InpEntryRSIPeriod   = 14;           // Entry RSI period
-input double           InpEntryRSIOB       = 70.0;         // Entry RSI overbought
-input double           InpEntryRSIOS       = 30.0;         // Entry RSI oversold
-input double           InpEngulfRatio      = 1.5;          // Min engulf body ratio
-input int              InpATRPeriod        = 14;           // ATR period for entries
-input double           InpMinBodyATR       = 0.3;          // Min body/ATR ratio for strong bar
+//+------------------------------------------------------------------+
+//| Threshold helper (returns threshold based on current mode)       |
+//+------------------------------------------------------------------+
+double GetContThreshold()
+  {
+   switch(InpTradeMode)
+     {
+      case TRADE_MODE_SAFE:       return InpCont_ThreshSafe;
+      case TRADE_MODE_NORMAL:     return InpCont_ThreshNorm;
+      case TRADE_MODE_AGGRESSIVE: return InpCont_ThreshAggr;
+      default:                    return InpCont_ThreshNorm;
+     }
+  }
+double GetRevThreshold()
+  {
+   switch(InpTradeMode)
+     {
+      case TRADE_MODE_SAFE:       return InpRev_ThreshSafe;
+      case TRADE_MODE_NORMAL:     return InpRev_ThreshNorm;
+      case TRADE_MODE_AGGRESSIVE: return InpRev_ThreshAggr;
+      default:                    return InpRev_ThreshNorm;
+     }
+  }
 
-//--- [ Dashboard ]
-input group            "═══ Dashboard ═══"
-input bool             InpShowDashboard    = true;         // Show on-chart dashboard
+//+------------------------------------------------------------------+
+//| Get best open trade R for dashboard                              |
+//+------------------------------------------------------------------+
+void GetBestOpenR(double &maxR, double &curR)
+  {
+   maxR = 0; curR = 0;
+   ulong tickets[];
+   int cnt = g_trade.GetOpenTickets(tickets);
+   double bestMax = -999;
+   for(int i = 0; i < cnt; i++)
+     {
+      double m = g_exit.GetMaxR(tickets[i]);
+      double c = g_exit.GetCurrentR(tickets[i]);
+      if(m > bestMax) { bestMax = m; maxR = m; curR = c; }
+     }
+   if(bestMax < 0) { maxR = 0; curR = 0; }
+  }
 
-//==================================================================//
-//                     MODULE INSTANCES                             //
-//==================================================================//
-
-CPropProtection   *g_prop     = NULL;
-CSessionFilter    *g_session  = NULL;
-CNewsFilter       *g_news     = NULL;
-CMarketStructure  *g_htfMS    = NULL;
-CMarketStructure  *g_setupMS  = NULL;
-CSignalEngine     *g_signal   = NULL;
-CEntryEngine      *g_entry    = NULL;
-CRiskManager      *g_risk     = NULL;
-CTradeManager     *g_trade    = NULL;
-CExitManager      *g_exit     = NULL;
-CDashboard        *g_dash     = NULL;
-
-//--- Bar tracking
-datetime g_lastBarTime   = 0;    // Last M5 bar open time processed
-datetime g_lastHTFBar    = 0;    // Last HTF bar processed
-datetime g_lastSetupBar  = 0;    // Last setup bar processed
-datetime g_lastDashUpdate = 0;   // Last dashboard refresh
-bool     g_initialised   = false;
-
-//==================================================================//
-//                           OnInit                                 //
-//==================================================================//
+//+------------------------------------------------------------------+
+//| Expert initialisation                                            |
+//+------------------------------------------------------------------+
 int OnInit()
   {
    g_LogLevel = InpLogLevel;
-   LogInfo("MainEA", "===== EA102 XAUUSD Prop Firm EA Starting =====");
+   LogInfo("MainEA", "═══ EA102 v2 STARTING ═══");
 
-   string sym = (StringLen(InpSymbol) > 0) ? InpSymbol : _Symbol;
+   string sym = _Symbol;
+   int    mag = InpMagicNumber;
 
-   //--- Allocate modules
-   g_prop    = new CPropProtection();
-   g_session = new CSessionFilter();
-   g_news    = new CNewsFilter();
-   g_htfMS   = new CMarketStructure();
-   g_setupMS = new CMarketStructure();
-   g_signal  = new CSignalEngine();
-   g_entry   = new CEntryEngine();
-   g_risk    = new CRiskManager();
-   g_trade   = new CTradeManager();
-   g_exit    = new CExitManager();
-   g_dash    = new CDashboard();
+   //--- Prop Protection
+   if(!g_prop.Init(sym, InpMaxDDPct, InpDailyDDPct,
+                   InpUseProfitLock, InpProfitLockPct,
+                   InpEmergencyClose, mag)) return INIT_FAILED;
 
-   if(!g_prop.Init(sym,
-                   InpMaxDDPct, InpDailyDDPct,
-                   InpUseDailyProfitLock, InpDailyProfitLockPct,
-                   InpUseEmergencyClose, InpMagicNumber))
-     { Alert("PropProtection init failed"); return INIT_FAILED; }
-
-   if(!g_session.Init(sym, InpMagicNumber,
-                      InpSessionFilterOn, InpCloseOutsideSession,
+   //--- Session Filter
+   if(!g_session.Init(sym, mag, InpUseSession, InpSessionClose,
                       InpUseLondon, InpLondonStart, InpLondonEnd,
                       InpUseNewYork, InpNYStart, InpNYEnd,
-                      InpUseAsian, InpAsianStart, InpAsianEnd))
-     { Alert("SessionFilter init failed"); return INIT_FAILED; }
+                      InpUseAsian, InpAsianStart, InpAsianEnd)) return INIT_FAILED;
 
-   if(!g_news.Init(InpNewsFilterOn,
-                   InpNewsMinsB4, InpNewsMinsAfter,
-                   InpAutoBlockNFP, InpNFPHour, InpNFPWindowMins,
-                   InpAutoBlockFOMC, InpFOMCHour))
-     { Alert("NewsFilter init failed"); return INIT_FAILED; }
+   //--- News Filter
+   if(!g_news.Init(InpUseNews, InpNewsMinsBefore, InpNewsMinsAfter,
+                   InpAutoNFP, InpNFP_Hour, InpNFP_Window,
+                   InpAutoFOMC, InpFOMC_Hour)) return INIT_FAILED;
 
-   // Register manual news events
-   if(StringLen(InpNews1DateTime) > 4)
-      g_news.AddEventFromString(InpNews1DateTime, InpNews1Desc);
-   if(StringLen(InpNews2DateTime) > 4)
-      g_news.AddEventFromString(InpNews2DateTime, InpNews2Desc);
-   if(StringLen(InpNews3DateTime) > 4)
-      g_news.AddEventFromString(InpNews3DateTime, InpNews3Desc);
+   //--- Market Structure (HTF + Setup TF)
+   if(!g_htfMS.Init(sym, InpHTF_TF,   InpMS_Lookback, InpMS_SwingStr)) return INIT_FAILED;
+   if(!g_setupMS.Init(sym, InpSetupTF, InpMS_Lookback, InpMS_SwingStr)) return INIT_FAILED;
 
-   if(!g_htfMS.Init(sym, InpHTFTimeframe, InpHTFLookback, InpHTFSwingStr))
-     { Alert("HTF MarketStructure init failed"); return INIT_FAILED; }
+   //--- Signal Engine (dual: Continuation + Reversal)
+   if(!g_signal.Init(sym, InpHTF_TF, InpSetupTF,
+                     InpEMA_Fast, InpEMA_Slow, InpRSI_Period,
+                     InpTradeMode, &g_htfMS, &g_setupMS)) return INIT_FAILED;
 
-   if(!g_setupMS.Init(sym, InpSetupTimeframe, InpSetupLookback, InpSetupSwingStr))
-     { Alert("Setup MarketStructure init failed"); return INIT_FAILED; }
+   //--- Risk Manager
+   if(!g_risk.Init(sym, mag, InpRiskPct, InpMaxExposurePct,
+                   InpMaxOpenTrades, InpTradeMode,
+                   InpAllowHedge, InpMaxTradesDay, InpMaxTradesSess)) return INIT_FAILED;
 
-   if(!g_signal.Init(sym, InpHTFTimeframe, InpSetupTimeframe,
-                     InpEMAFast, InpEMASlow, InpRSIPeriod,
-                     InpRSIBullMin, InpRSIBullMax, InpRSIBearMin, InpRSIBearMax,
-                     InpTradeMode, g_htfMS, g_setupMS))
-     { Alert("SignalEngine init failed"); return INIT_FAILED; }
+   //--- Trade Manager
+   if(!g_trade.Init(sym, mag, InpSlippage, InpEAComment)) return INIT_FAILED;
 
-   if(!g_entry.Init(sym, InpEntryTimeframe, InpSetupTimeframe,
-                    InpEntryRSIPeriod, InpEntryRSIOB, InpEntryRSIOS,
-                    InpEngulfRatio, InpATRPeriod, InpMinBodyATR,
-                    InpSLMode, InpSLAtrMul, InpTPMode, InpRRRatio))
-     { Alert("EntryEngine init failed"); return INIT_FAILED; }
+   //--- Entry Engine
+   if(!g_entry.Init(sym, InpEntryTF, InpSetupTF,
+                    InpRSI_Period, InpRSI_OB, InpRSI_OS,
+                    InpEngulfRatio, InpEntry_ATR_Per, InpMinBodyATR,
+                    InpSL_Mode, InpSL_ATR_Mul, InpTP_Mode, InpRR_Ratio)) return INIT_FAILED;
 
-   if(!g_risk.Init(sym, InpMagicNumber,
-                   InpRiskPct, InpMaxExposurePct, InpMaxOpenTrades,
-                   InpMaxSymbolRiskPct, InpTradeMode,
-                   InpAllowHedge, InpMaxTradesPerDay, InpMaxTradesPerSess))
-     { Alert("RiskManager init failed"); return INIT_FAILED; }
+   //--- Exit Manager (Profit Protection Engine)
+   if(!g_exit.Init(&g_trade, sym, mag,
+                   InpUseBE,   InpBE_TriggerR, InpBE_BufferPts,
+                   InpUsePartial, InpPartial_R, InpPartial_Pct,
+                   InpUseGiveback,
+                   InpGiveR1, InpGiveDrop1,
+                   InpGiveR2, InpGiveDrop2,
+                   InpRevExit, InpRevExitScore,
+                   InpUseTrail, InpTrail_ATR_Per, InpTrail_ATR_Mul,
+                   InpSetupTF)) return INIT_FAILED;
 
-   if(!g_trade.Init(sym, InpMagicNumber, InpSlippage, InpTradeComment))
-     { Alert("TradeManager init failed"); return INIT_FAILED; }
-
-   if(!g_exit.Init(g_trade, sym, InpMagicNumber,
-                   InpUseBE, InpBETriggerR, InpBEBufferPoints,
-                   InpUsePartialClose, InpPartialCloseR, InpPartialClosePct,
-                   InpUseTrailing, InpTrailingAtrPeriod, InpTrailingAtrMul))
-     { Alert("ExitManager init failed"); return INIT_FAILED; }
-
+   //--- Dashboard
    if(InpShowDashboard)
-     {
-      if(!g_dash.Init(g_prop, g_session, g_news, g_risk))
-        { Alert("Dashboard init failed"); return INIT_FAILED; }
-     }
+      g_dash.Init(&g_prop, &g_session, &g_news, &g_risk);
 
-   g_initialised = true;
-   LogInfo("MainEA", "All modules initialised successfully");
-   LogInfo("MainEA", StringFormat("Mode=%-10s Magic=%-8d Symbol=%s",
-           EnumToString(InpTradeMode), InpMagicNumber, sym));
-
+   LogInfo("MainEA", "══ Initialisation complete ══");
    return INIT_SUCCEEDED;
   }
 
-//==================================================================//
-//                           OnDeinit                               //
-//==================================================================//
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
-   LogInfo("MainEA", StringFormat("Deinitialising | Reason=%d", reason));
-
-   if(g_dash    != NULL) { g_dash.Destroy();    delete g_dash;    g_dash    = NULL; }
-   if(g_exit    != NULL) { delete g_exit;        g_exit    = NULL; }
-   if(g_trade   != NULL) { delete g_trade;       g_trade   = NULL; }
-   if(g_risk    != NULL) { delete g_risk;         g_risk    = NULL; }
-   if(g_entry   != NULL) { delete g_entry;        g_entry   = NULL; }
-   if(g_signal  != NULL) { delete g_signal;       g_signal  = NULL; }
-   if(g_setupMS != NULL) { delete g_setupMS;      g_setupMS = NULL; }
-   if(g_htfMS   != NULL) { delete g_htfMS;        g_htfMS   = NULL; }
-   if(g_news    != NULL) { delete g_news;          g_news    = NULL; }
-   if(g_session != NULL) { delete g_session;       g_session = NULL; }
-   if(g_prop    != NULL) { delete g_prop;          g_prop    = NULL; }
+   g_dash.Destroy();
+   LogInfo("MainEA", "Deinitialized | reason=" + IntegerToString(reason));
   }
 
-//==================================================================//
-//                           OnTick                                 //
-//==================================================================//
+//+------------------------------------------------------------------+
+//| Main tick                                                        |
+//+------------------------------------------------------------------+
 void OnTick()
   {
-   if(!g_initialised) return;
+   //================================================================
+   // STEP 0 — Reversal signal (computed EVERY tick for ExitManager)
+   //================================================================
+   ReversalSignal revSig = g_signal.GetReversalSignal();
+   g_revScore = revSig.score;
+   g_revDir   = revSig.direction;
 
-   string sym = (StringLen(InpSymbol) > 0) ? InpSymbol : _Symbol;
+   //================================================================
+   // STEP 1 — PROFIT PROTECTION ENGINE (runs EVERY tick, BEFORE all)
+   //================================================================
+   g_exit.Update(InpEntryTF, revSig);
 
-   //-------------------------------------------------------------
-   // PRIORITY 1: Prop protection update (runs every tick)
-   //-------------------------------------------------------------
+   //================================================================
+   // STEP 2 — Prop Protection update (checks DD, triggers close)
+   //================================================================
    g_prop.Update();
 
-   // PRIORITY 1a: Max DD breached → hard stop, close everything
    if(g_prop.IsMaxDDBreached())
      {
-      static bool maxDDAlerted = false;
-      if(!maxDDAlerted)
+      g_dash.SetStatus(false, "MAX DD HIT");
+      if(InpShowDashboard)
         {
-         LogError("MainEA", "MAX DD BREACHED — EA permanently disabled for this session!");
-         g_trade.CloseAllPositions("MAX DD BREACH");
-         maxDDAlerted = true;
+         double mr, cr; GetBestOpenR(mr, cr);
+         g_dash.SetEngineScores(g_contScoreBuy, g_contScoreSell, g_revScore, g_revDir, g_lastSigType, mr, cr);
+         g_dash.Update();
         }
-      UpdateDashboard("DISABLED", false);
       return;
      }
 
-   //-------------------------------------------------------------
-   // EXIT MANAGEMENT — runs every tick on all open positions
-   //-------------------------------------------------------------
-   g_exit.Update(InpEntryTimeframe);
-
-   //-------------------------------------------------------------
-   // PRIORITY 2: Daily DD blocked — no new trades today
-   //-------------------------------------------------------------
    if(g_prop.IsDailyDDBlocked())
      {
-      UpdateDashboard("DAILY DD BLOCKED", false);
+      g_dash.SetStatus(false, "DAILY BLOCKED");
+      if(InpShowDashboard)
+        {
+         double mr, cr; GetBestOpenR(mr, cr);
+         g_dash.SetEngineScores(g_contScoreBuy, g_contScoreSell, g_revScore, g_revDir, g_lastSigType, mr, cr);
+         g_dash.Update();
+        }
       return;
      }
 
-   //-------------------------------------------------------------
-   // Daily profit lock — block new entries  
-   //-------------------------------------------------------------
    if(g_prop.IsDailyProfitLocked())
      {
-      UpdateDashboard("PROFIT LOCKED", false);
+      g_dash.SetStatus(false, "PROFIT LOCKED");
+      if(InpShowDashboard)
+        {
+         double mr, cr; GetBestOpenR(mr, cr);
+         g_dash.SetEngineScores(g_contScoreBuy, g_contScoreSell, g_revScore, g_revDir, g_lastSigType, mr, cr);
+         g_dash.Update();
+        }
       return;
      }
 
-   //-------------------------------------------------------------
-   // Only analyse signals on new M5 bars (avoid duplicate signals)
-   //-------------------------------------------------------------
-   datetime currentBarTime = iTime(sym, InpEntryTimeframe, 0);
-   bool isNewEntryBar  = (currentBarTime != g_lastBarTime);
+   g_dash.SetStatus(true, "ACTIVE");
 
-   datetime currentHTFBar   = iTime(sym, InpHTFTimeframe,   0);
-   bool isNewHTFBar    = (currentHTFBar != g_lastHTFBar);
+   //================================================================
+   // STEP 3 — Session gate (S)
+   //================================================================
+   if(!g_session.IsInSession()) { UpdateDash(); return; }
+   g_session.CloseTradesOutsideSession();
 
-   datetime currentSetupBar = iTime(sym, InpSetupTimeframe, 0);
-   bool isNewSetupBar  = (currentSetupBar != g_lastSetupBar);
+   //================================================================
+   // STEP 4 — News gate (N)
+   //================================================================
+   if(g_news.IsNewsBlocked()) { UpdateDash(); return; }
 
-   // Update market structure on new bars
-   if(isNewHTFBar)
+   //================================================================
+   // STEP 5 — New-bar check on Entry TF (reduces noise)
+   //================================================================
+   datetime currentBar = iTime(_Symbol, InpEntryTF, 0);
+   bool isNewEntryBar  = (currentBar != g_lastEntryBar);
+   if(isNewEntryBar) g_lastEntryBar = currentBar;
+
+   //--- Market structure: update on new bar of respective TF
+   if(iTime(_Symbol, InpHTF_TF, 0) != g_lastHTFBar)
      {
+      g_lastHTFBar = iTime(_Symbol, InpHTF_TF, 0);
       g_htfMS.Update();
       g_htfMS.PruneStaleOBs();
-      g_lastHTFBar = currentHTFBar;
      }
-
-   if(isNewSetupBar)
+   if(iTime(_Symbol, InpSetupTF, 0) != g_lastSetupBar)
      {
+      g_lastSetupBar = iTime(_Symbol, InpSetupTF, 0);
       g_setupMS.Update();
       g_setupMS.PruneStaleOBs();
-      g_lastSetupBar = currentSetupBar;
      }
 
-   //-------------------------------------------------------------
-   // PRIORITY 3: Session filter
-   //-------------------------------------------------------------
-   g_session.CloseTradesOutsideSession();   // Handles close-outside if configured
+   //--- Update dashboard on every tick (to show live R)
+   {
+      double mr, cr; GetBestOpenR(mr, cr);
+      g_contScoreBuy  = g_signal.GetContinuationSignal(SIGNAL_BUY).score;
+      g_contScoreSell = g_signal.GetContinuationSignal(SIGNAL_SELL).score;
+      g_dash.SetEngineScores(g_contScoreBuy, g_contScoreSell, g_revScore, g_revDir, g_lastSigType, mr, cr);
+      if(InpShowDashboard) g_dash.Update();
+   }
 
-   if(!g_session.IsInSession())
+   //--- Only evaluate new entries on new Entry-TF bars
+   if(!isNewEntryBar) return;
+
+   //================================================================
+   // STEP 6 — Frequency gate (F)
+   //================================================================
+   g_risk.UpdateDailyCounters();
+   string freqReason;
+   if(!g_risk.IsFrequencyGateOpen(freqReason)) { LogDebug("MainEA", "FreqGate: " + freqReason); return; }
+
+   //================================================================
+   // STEP 7 — Get BOTH engine signals
+   //================================================================
+   ContinuationSignal contBuy  = g_signal.GetContinuationSignal(SIGNAL_BUY);
+   ContinuationSignal contSell = g_signal.GetContinuationSignal(SIGNAL_SELL);
+   g_contScoreBuy  = contBuy.score;
+   g_contScoreSell = contSell.score;
+
+   // Continuation: pick direction with higher score
+   ContinuationSignal bestCont;
+   if(contBuy.score >= contSell.score) bestCont = contBuy;
+   else                                bestCont = contSell;
+
+   // Reversal already computed above
+   double contThresh = GetContThreshold();
+   double revThresh  = GetRevThreshold();
+
+   //================================================================
+   // STEP 8 — Impulse entry check (AGGRESSIVE / NORMAL)
+   //================================================================
+   ENUM_SIGNAL_DIR impulseDir = SIGNAL_NONE;
+   bool hasImpulse = (InpTradeMode >= TRADE_MODE_NORMAL) && g_entry.IsImpulseEntry(impulseDir);
+
+   //================================================================
+   // STEP 9 — Determine winning signal (OR logic — Reversal OR Cont.)
+   //   Priority: Reversal (highest score, independent) > Continuation > Impulse
+   //================================================================
+   ENUM_SIGNAL_DIR  tradeDir   = SIGNAL_NONE;
+   ENUM_SIGNAL_TYPE tradeType  = SIGNAL_TYPE_NONE;
+   double           tradeSc    = 0;
+   string           tradeRsn   = "";
+
+   // Reversal engine wins if it meets threshold
+   if(revSig.direction != SIGNAL_NONE && revSig.score >= revThresh)
      {
-      UpdateDashboard("OUT OF SESSION", false);
-      return;
+      tradeDir  = revSig.direction;
+      tradeType = SIGNAL_TYPE_REVERSAL;
+      tradeSc   = revSig.score;
+      tradeRsn  = revSig.reason;
+      LogInfo("MainEA", StringFormat("REVERSAL ENGINE | dir=%s score=%.0f%% | %s",
+              SignalDirStr(tradeDir), tradeSc * 100, tradeRsn));
      }
-
-   //-------------------------------------------------------------
-   // PRIORITY 4: News filter
-   //-------------------------------------------------------------
-   if(g_news.IsNewsBlocked())
+   // Continuation engine (only if reversal not taken)
+   else if(bestCont.direction != SIGNAL_NONE && bestCont.score >= contThresh)
      {
-      UpdateDashboard("NEWS BLOCKED: " + g_news.GetBlockReason(), false);
-      return;
+      tradeDir  = bestCont.direction;
+      tradeType = SIGNAL_TYPE_CONTINUATION;
+      tradeSc   = bestCont.score;
+      tradeRsn  = bestCont.reason;
+      LogInfo("MainEA", StringFormat("CONTINUATION ENGINE | dir=%s score=%.0f%% | %s",
+              SignalDirStr(tradeDir), tradeSc * 100, tradeRsn));
      }
-
-   //-------------------------------------------------------------
-   // Only evaluate new trade signals on new M5 bar
-   //-------------------------------------------------------------
-   if(!isNewEntryBar)
+   // Impulse breakout (AGGRESSIVE/NORMAL only)
+   else if(hasImpulse && InpTradeMode >= TRADE_MODE_NORMAL)
      {
-      UpdateDashboard("ACTIVE", true);
-      return;
-     }
-   g_lastBarTime = currentBarTime;
-
-   //-------------------------------------------------------------
-   // PRIORITY 5: Frequency gate (condition F)
-   //-------------------------------------------------------------
-   string freqReason = "";
-   if(!g_risk.IsFrequencyGateOpen(freqReason))
-     {
-      LogDebug("MainEA", "Freq gate closed: " + freqReason);
-      UpdateDashboard("COOLDOWN", true);
-      return;
+      tradeDir  = impulseDir;
+      tradeType = SIGNAL_TYPE_IMPULSE;
+      tradeSc   = 0.50;
+      tradeRsn  = "Impulse breakout";
+      LogInfo("MainEA", StringFormat("IMPULSE ENGINE | dir=%s", SignalDirStr(impulseDir)));
      }
 
-   //-------------------------------------------------------------
-   // PRIORITY 6: Signal engine (T + U)
-   //-------------------------------------------------------------
-   SignalPackage sig = g_signal.Evaluate();
+   if(tradeDir == SIGNAL_NONE) return;
 
-   if(sig.direction == SIGNAL_NONE)
-     {
-      LogDebug("MainEA", "No signal: " + sig.reason);
-      UpdateDashboard("ACTIVE", true);
-      return;
-     }
-
-   //-------------------------------------------------------------
-   // Update entry engine swings from setup structure
-   //-------------------------------------------------------------
+   //================================================================
+   // STEP 10 — Entry confirmation (staged mode-based)
+   //================================================================
    g_entry.SetSwings(g_setupMS.GetLastSwingHigh(), g_setupMS.GetLastSwingLow());
-
-   //-------------------------------------------------------------
-   // PRIORITY 6b: Entry confirmation (condition E)
-   //-------------------------------------------------------------
-   EntryConfirmation ec = g_entry.CheckEntry(sig.direction);
+   EntryConfirmation ec = g_entry.CheckEntry(tradeDir, tradeType, InpTradeMode, tradeSc);
 
    if(!ec.confirmed)
      {
       LogDebug("MainEA", "Entry not confirmed: " + ec.reason);
-      UpdateDashboard("WAITING ENTRY", true);
       return;
      }
 
-   //-------------------------------------------------------------
-   // PRIORITY 7: Exposure gate (condition X)
-   //-------------------------------------------------------------
-   double slDist = MathAbs(ec.entryPrice - ec.stopLoss);
-   string expReason = "";
-
-   if(!g_risk.IsExposureAllowed(sig.direction, slDist, expReason))
+   //================================================================
+   // STEP 11 — Exposure gate (X)
+   //================================================================
+   string expReason;
+   if(!g_risk.IsExposureAllowed(tradeDir, MathAbs(ec.entryPrice - ec.stopLoss), expReason))
      {
-      LogDebug("MainEA", "Exposure blocked: " + expReason);
-      UpdateDashboard("EXPOSURE LIMIT", false);
+      LogDebug("MainEA", "ExposureGate: " + expReason);
       return;
      }
 
-   //-------------------------------------------------------------
-   // ALL GATES PASSED — Calculate lot size and execute trade
-   //-------------------------------------------------------------
+   //================================================================
+   // STEP 12 — Calculate lot size and EXECUTE
+   //================================================================
    double lots = g_risk.CalculateLotSize(ec.entryPrice, ec.stopLoss);
+   if(lots <= 0)
+     {
+      LogWarn("MainEA", "Lot size = 0, skip");
+      return;
+     }
 
    ulong ticket = 0;
    if(g_trade.OpenTrade(ec, lots, ticket))
      {
+      g_lastSigType = tradeType;
+      g_exit.RegisterTrade(ticket, tradeDir, tradeType, ec.entryPrice, ec.stopLoss);
       g_risk.OnTradeOpened();
-      LogInfo("MainEA", StringFormat(
-         "NEW TRADE | %s %.2f @ %.5f | SL=%.5f TP=%.5f | Score=%.2f | %s",
-         (sig.direction == SIGNAL_BUY ? "BUY" : "SELL"),
-         lots, ec.entryPrice, ec.stopLoss, ec.takeProfit,
-         sig.setupScore, sig.reason));
+      LogInfo("MainEA", StringFormat("▶ TRADE OPENED | %s %.2f lots | SL=%.5f TP=%.5f | Score=%.0f%% | Type=%s",
+              SignalDirStr(tradeDir), lots, ec.stopLoss, ec.takeProfit,
+              tradeSc * 100, SignalTypeStr(tradeType)));
      }
-
-   UpdateDashboard("ACTIVE", true);
   }
 
-//==================================================================//
-//                     Helper Functions                             //
-//==================================================================//
-
-//--- Refresh dashboard with current status
-void UpdateDashboard(const string statusText, bool active)
+//+------------------------------------------------------------------+
+//| Dashboard helper (called in early-return paths)                 |
+//+------------------------------------------------------------------+
+void UpdateDash()
   {
-   if(!InpShowDashboard || g_dash == NULL) return;
-
-   // Only refresh every second to avoid chart spam
-   datetime now = TimeCurrent();
-   if(now - g_lastDashUpdate < 1) return;
-   g_lastDashUpdate = now;
-
-   g_dash.SetStatus(active, statusText);
+   if(!InpShowDashboard) return;
+   double mr, cr; GetBestOpenR(mr, cr);
+   g_dash.SetEngineScores(g_contScoreBuy, g_contScoreSell, g_revScore, g_revDir, g_lastSigType, mr, cr);
    g_dash.Update();
   }
 
-//--- Called when a trade is closed (to detect loss for cooldown)
+//+------------------------------------------------------------------+
+//| Trade transaction handler — detect loss for cooldown            |
+//+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest     &request,
                         const MqlTradeResult      &result)
   {
-   if(!g_initialised) return;
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+   if(!HistoryDealSelect(trans.deal)) return;
+   if((int)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagicNumber) return;
+   if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol) return;
 
-   // Detect position close of our magic number
-   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
-     {
-      if(trans.deal_type == DEAL_TYPE_BUY || trans.deal_type == DEAL_TYPE_SELL)
-        {
-         if((int)trans.position == 0) return;
+   long   entry  = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
 
-         // Check deal profit to detect loss
-         ulong dealTicket = trans.deal;
-         if(HistoryDealSelect(dealTicket))
-           {
-            int dealMagic = (int)HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
-            if(dealMagic != InpMagicNumber) return;
-
-            double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-            if(dealProfit < 0)
-              {
-               LogInfo("MainEA", StringFormat("Loss detected: $%.2f | Cooldown started", dealProfit));
-               g_risk.OnTradeLoss();
-              }
-           }
-        }
-     }
+   // Detect trade closure — if in loss, trigger loss cooldown
+   if(entry == DEAL_ENTRY_OUT && profit < 0)
+      g_risk.OnTradeLoss();
   }
+
+//+------------------------------------------------------------------+
+//| END OF MainEA.mq5                                               |
 //+------------------------------------------------------------------+
