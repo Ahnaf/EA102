@@ -27,6 +27,21 @@ struct ReversalSignal
    bool            choch;      // Change of character confirmed?
   };
 
+//--- Score weights (continuation engine) — file-scope constants
+const double W_HTF_EMA   = 0.20;
+const double W_HTF_STRUC = 0.20;
+const double W_OB        = 0.25;
+const double W_FVG       = 0.12;
+const double W_RSI       = 0.12;
+const double W_CANDLE    = 0.11;
+
+//--- Score weights (reversal engine)
+const double WR_LIQSWEEP = 0.30;
+const double WR_CHOCH    = 0.25;
+const double WR_CANDLE   = 0.20;
+const double WR_RSI      = 0.15;
+const double WR_ATR_EXP  = 0.10;
+
 //+------------------------------------------------------------------+
 //| CSignalEngine — dual engine                                     |
 //+------------------------------------------------------------------+
@@ -43,20 +58,7 @@ private:
    CMarketStructure *m_htfMS;
    CMarketStructure *m_setupMS;
 
-   //--- Score weights (continuation)
-   static const double W_HTF_EMA       = 0.20;
-   static const double W_HTF_STRUC     = 0.20;
-   static const double W_OB            = 0.25;
-   static const double W_FVG           = 0.12;
-   static const double W_RSI           = 0.12;
-   static const double W_CANDLE        = 0.11;
-
-   //--- Score weights (reversal)
-   static const double WR_LIQSWEEP     = 0.30;
-   static const double WR_CHOCH        = 0.25;
-   static const double WR_CANDLE       = 0.20;
-   static const double WR_RSI          = 0.15;
-   static const double WR_ATR_EXP      = 0.10;
+   //--- (Weights are file-scope constants defined above the class)
 
    //--- Internal: strong bullish/bearish candle check
    bool IsStrongBullCandle(ENUM_TIMEFRAMES tf, int shift = 1) const

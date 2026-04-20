@@ -78,26 +78,25 @@ private:
       return -1;
      }
 
-   //--- Calculate current R multiple for a position
-   double CalcCurrentR(const TradeRecord &rec) const
+   //--- Calculate current R multiple for a position (by record index)
+   double CalcCurrentR(int idx) const
      {
-      if(rec.oneR <= 0) return 0;
-      if(!PositionSelectByTicket(rec.ticket)) return 0;
+      if(m_records[idx].oneR <= 0) return 0;
+      if(!PositionSelectByTicket(m_records[idx].ticket)) return 0;
       double price = PositionGetDouble(POSITION_PRICE_CURRENT);
-      return (rec.direction == SIGNAL_BUY) ? (price - rec.entryPrice) / rec.oneR
-                                           : (rec.entryPrice - price) / rec.oneR;
+      return (m_records[idx].direction == SIGNAL_BUY)
+             ? (price - m_records[idx].entryPrice) / m_records[idx].oneR
+             : (m_records[idx].entryPrice - price) / m_records[idx].oneR;
      }
 
-   //--- Momentum fade: check if candle opposes position + RSI crossing midline
-   bool IsMomentumFade(const TradeRecord &rec, ENUM_TIMEFRAMES tf) const
+   //--- Momentum fade: check if candle opposes position
+   bool IsMomentumFade(int idx, ENUM_TIMEFRAMES tf) const
      {
-      // Opposite strong candle on entry TF
       double atr  = GetATR(m_symbol, tf, m_trailAtrPeriod, 1);
       double body = CandleBody(m_symbol, tf, 1);
-      if(body < 0.35 * atr) return false;  // Not strong enough
-
-      if(rec.direction == SIGNAL_BUY && IsBearishCandle(m_symbol, tf, 1)) return true;
-      if(rec.direction == SIGNAL_SELL && IsBullishCandle(m_symbol, tf, 1)) return true;
+      if(body < 0.35 * atr) return false;
+      if(m_records[idx].direction == SIGNAL_BUY  && IsBearishCandle(m_symbol, tf, 1)) return true;
+      if(m_records[idx].direction == SIGNAL_SELL && IsBullishCandle(m_symbol, tf, 1)) return true;
       return false;
      }
 
@@ -193,153 +192,149 @@ public:
      {
       CleanupClosedPositions();
 
-      for(int i = 0; i < m_recordCount; i++)
-        {
-         if(!m_records[i].active) continue;
-         if(!PositionSelectByTicket(m_records[i].ticket)) continue;
+       for(int i = 0; i < m_recordCount; i++)
+         {
+          if(!m_records[i].active) continue;
+          if(!PositionSelectByTicket(m_records[i].ticket)) continue;
 
-         TradeRecord &rec = m_records[i];
+          // Update R tracking
+          m_records[i].currentR = CalcCurrentR(i);
+          if(m_records[i].currentR > m_records[i].maxR) m_records[i].maxR = m_records[i].currentR;
 
-         // Update R tracking
-         rec.currentR = CalcCurrentR(rec);
-         if(rec.currentR > rec.maxR) rec.maxR = rec.currentR;
+          double curSL = PositionGetDouble(POSITION_SL);
+          double curTP = PositionGetDouble(POSITION_TP);
+          double lots  = PositionGetDouble(POSITION_VOLUME);
 
-         double curSL = PositionGetDouble(POSITION_SL);
-         double curTP = PositionGetDouble(POSITION_TP);
-         double lots  = PositionGetDouble(POSITION_VOLUME);
+          //------------------------------------------------------------
+          // EXIT PRIORITY 1: Reversal signal against this position
+          //------------------------------------------------------------
+          if(m_useReversalExit && revSig.score >= m_reversalExitScore)
+            {
+             bool revAgainst = (m_records[i].direction == SIGNAL_BUY  && revSig.direction == SIGNAL_SELL)
+                            || (m_records[i].direction == SIGNAL_SELL && revSig.direction == SIGNAL_BUY);
 
-         //------------------------------------------------------------
-         // EXIT PRIORITY 1: Reversal signal against this position
-         //------------------------------------------------------------
-         if(m_useReversalExit && revSig.score >= m_reversalExitScore)
-           {
-            bool revAgainst = (rec.direction == SIGNAL_BUY  && revSig.direction == SIGNAL_SELL)
-                           || (rec.direction == SIGNAL_SELL && revSig.direction == SIGNAL_BUY);
+             if(revAgainst && m_records[i].currentR > 0)
+               {
+                LogInfo("ExitManager", StringFormat("REVERSAL EXIT | ticket=%I64u R=%.2f RevScore=%.2f",
+                        m_records[i].ticket, m_records[i].currentR, revSig.score));
+                m_trade.ClosePosition(m_records[i].ticket);
+                m_records[i].active = false;
+                continue;
+               }
+             // Close in loss if reversal is very strong (liq sweep + CHOCH)
+             if(revAgainst && revSig.liqSweep && revSig.choch && revSig.score >= 0.70)
+               {
+                LogInfo("ExitManager", StringFormat("STRONG REVERSAL EXIT (loss) | ticket=%I64u R=%.2f",
+                        m_records[i].ticket, m_records[i].currentR));
+                m_trade.ClosePosition(m_records[i].ticket);
+                m_records[i].active = false;
+                continue;
+               }
+            }
 
-            if(revAgainst && rec.currentR > 0)  // Only close if in profit
-              {
-               LogInfo("ExitManager", StringFormat("REVERSAL EXIT | ticket=%I64u R=%.2f RevScore=%.2f",
-                       rec.ticket, rec.currentR, revSig.score));
-               m_trade.ClosePosition(rec.ticket);
-               rec.active = false;
-               continue;
-              }
-            // Also close in loss if reversal is very strong (liq sweep + CHOCH)
-            if(revAgainst && revSig.liqSweep && revSig.choch && revSig.score >= 0.70)
-              {
-               LogInfo("ExitManager", StringFormat("STRONG REVERSAL EXIT (loss) | ticket=%I64u R=%.2f",
-                       rec.ticket, rec.currentR));
-               m_trade.ClosePosition(rec.ticket);
-               rec.active = false;
-               continue;
-              }
-           }
+          //------------------------------------------------------------
+          // EXIT PRIORITY 2: Strong giveback — maxR >= R2 and dropped by Drop2
+          //------------------------------------------------------------
+          if(m_useGiveback && m_records[i].maxR >= m_givebackR2
+             && m_records[i].currentR < (m_records[i].maxR - m_givebackDrop2))
+            {
+             LogInfo("ExitManager", StringFormat("STRONG GIVEBACK | ticket=%I64u maxR=%.2f curR=%.2f",
+                     m_records[i].ticket, m_records[i].maxR, m_records[i].currentR));
+             m_trade.ClosePosition(m_records[i].ticket);
+             m_records[i].active = false;
+             continue;
+            }
 
-         //------------------------------------------------------------
-         // EXIT PRIORITY 2: Strong giveback protection
-         // maxR >= 2.0 AND currentR drops below 1.0 → protect profits
-         //------------------------------------------------------------
-         if(m_useGiveback && rec.maxR >= m_givebackR2 && rec.currentR < (rec.maxR - m_givebackDrop2))
-           {
-            LogInfo("ExitManager", StringFormat("STRONG GIVEBACK | ticket=%I64u maxR=%.2f curR=%.2f",
-                    rec.ticket, rec.maxR, rec.currentR));
-            m_trade.ClosePosition(rec.ticket);
-            rec.active = false;
-            continue;
-           }
+          //------------------------------------------------------------
+          // EXIT PRIORITY 3: Moderate giveback — maxR >= R1 and dropped by Drop1
+          //------------------------------------------------------------
+          if(m_useGiveback && m_records[i].maxR >= m_givebackR1
+             && m_records[i].currentR < (m_records[i].maxR - m_givebackDrop1))
+            {
+             LogInfo("ExitManager", StringFormat("GIVEBACK | ticket=%I64u maxR=%.2f curR=%.2f",
+                     m_records[i].ticket, m_records[i].maxR, m_records[i].currentR));
+             m_trade.ClosePosition(m_records[i].ticket);
+             m_records[i].active = false;
+             continue;
+            }
 
-         //------------------------------------------------------------
-         // EXIT PRIORITY 3: Moderate giveback protection
-         // maxR >= 1.5 AND currentR drops significantly
-         //------------------------------------------------------------
-         if(m_useGiveback && rec.maxR >= m_givebackR1 && rec.currentR < (rec.maxR - m_givebackDrop1))
-           {
-            LogInfo("ExitManager", StringFormat("GIVEBACK | ticket=%I64u maxR=%.2f curR=%.2f",
-                    rec.ticket, rec.maxR, rec.currentR));
-            m_trade.ClosePosition(rec.ticket);
-            rec.active = false;
-            continue;
-           }
+          //------------------------------------------------------------
+          // EXIT PRIORITY 4: Break-even
+          //------------------------------------------------------------
+          if(m_useBE && !m_records[i].beApplied && m_records[i].currentR >= m_beTriggerR)
+            {
+             double ptSize = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
+             double beBuf  = m_beBufferPoints * ptSize;
+             double beSL   = (m_records[i].direction == SIGNAL_BUY)
+                              ? m_records[i].entryPrice + beBuf
+                              : m_records[i].entryPrice - beBuf;
+             beSL = NormalizeDouble(beSL, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
 
-         //------------------------------------------------------------
-         // EXIT PRIORITY 4: Break-even
-         //------------------------------------------------------------
-         if(m_useBE && !rec.beApplied && rec.currentR >= m_beTriggerR)
-           {
-            double ptSize  = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
-            double beBuf   = m_beBufferPoints * ptSize;
-            double beSL    = (rec.direction == SIGNAL_BUY)
-                              ? rec.entryPrice + beBuf
-                              : rec.entryPrice - beBuf;
-            beSL = NormalizeDouble(beSL, (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
+             bool moveOK = (m_records[i].direction == SIGNAL_BUY)
+                           ? (beSL > curSL)
+                           : (beSL < curSL || curSL == 0);
+             if(moveOK && m_trade.ModifyPosition(m_records[i].ticket, beSL, curTP))
+               {
+                m_records[i].beApplied = true;
+                LogInfo("ExitManager", StringFormat("BE applied | ticket=%I64u SL=%.5f R=%.2f",
+                        m_records[i].ticket, beSL, m_records[i].currentR));
+               }
+            }
 
-            // Only move SL if it improves (moves in our direction)
-            bool moveOK = (rec.direction == SIGNAL_BUY)  ? (beSL > curSL)
-                                                          : (beSL < curSL || curSL == 0);
-            if(moveOK && m_trade.ModifyPosition(rec.ticket, beSL, curTP))
-              {
-               rec.beApplied = true;
-               LogInfo("ExitManager", StringFormat("BE applied | ticket=%I64u SL=%.5f R=%.2f",
-                       rec.ticket, beSL, rec.currentR));
-              }
-           }
+          //------------------------------------------------------------
+          // EXIT PRIORITY 5: Partial close
+          //------------------------------------------------------------
+          if(m_usePartial && !m_records[i].partialDone && m_records[i].currentR >= m_partialTriggerR)
+            {
+             double closeLots = NormalizeLots(m_symbol, lots * m_partialPct);
+             if(m_trade.ClosePartial(m_records[i].ticket, closeLots))
+               {
+                m_records[i].partialDone = true;
+                LogInfo("ExitManager", StringFormat("PARTIAL CLOSE | ticket=%I64u lots=%.2f R=%.2f",
+                        m_records[i].ticket, closeLots, m_records[i].currentR));
+               }
+            }
 
-         //------------------------------------------------------------
-         // EXIT PRIORITY 5: Partial close
-         //------------------------------------------------------------
-         if(m_usePartial && !rec.partialDone && rec.currentR >= m_partialTriggerR)
-           {
-            double closeLots = NormalizeLots(m_symbol, lots * m_partialPct);
-            if(m_trade.ClosePartial(rec.ticket, closeLots))
-              {
-               rec.partialDone = true;
-               LogInfo("ExitManager", StringFormat("PARTIAL CLOSE | ticket=%I64u lots=%.2f R=%.2f",
-                       rec.ticket, closeLots, rec.currentR));
-              }
-           }
+          //------------------------------------------------------------
+          // EXIT PRIORITY 6: Momentum fade (after partial)
+          //------------------------------------------------------------
+          if(m_records[i].partialDone && m_records[i].currentR > 0 && IsMomentumFade(i, entryTF))
+            {
+             if(m_records[i].currentR >= 1.0)
+               {
+                LogInfo("ExitManager", StringFormat("MOMENTUM FADE EXIT | ticket=%I64u R=%.2f",
+                        m_records[i].ticket, m_records[i].currentR));
+                m_trade.ClosePosition(m_records[i].ticket);
+                m_records[i].active = false;
+                continue;
+               }
+            }
 
-         //------------------------------------------------------------
-         // EXIT PRIORITY 6: Momentum fade (after partial)
-         //------------------------------------------------------------
-         if(rec.partialDone && rec.currentR > 0 && IsMomentumFade(rec, entryTF))
-           {
-            // Close remainder on momentum fade if past 1R profit
-            if(rec.currentR >= 1.0)
-              {
-               LogInfo("ExitManager", StringFormat("MOMENTUM FADE EXIT | ticket=%I64u R=%.2f",
-                       rec.ticket, rec.currentR));
-               m_trade.ClosePosition(rec.ticket);
-               rec.active = false;
-               continue;
-              }
-           }
+          //------------------------------------------------------------
+          // EXIT PRIORITY 7: ATR Trailing Stop (after BE applied)
+          //------------------------------------------------------------
+          if(m_useTrailing && m_records[i].beApplied)
+            {
+             double atr     = GetATR(m_symbol, m_trailTF, m_trailAtrPeriod, 1);
+             double price   = PositionGetDouble(POSITION_PRICE_CURRENT);
+             double trailSL = 0;
 
-         //------------------------------------------------------------
-         // EXIT PRIORITY 7: ATR Trailing Stop (runs last)
-         //------------------------------------------------------------
-         if(m_useTrailing && rec.beApplied)  // Only trail after BE applied
-           {
-            double atr     = GetATR(m_symbol, m_trailTF, m_trailAtrPeriod, 1);
-            double trailSL = 0;
-
-            if(rec.direction == SIGNAL_BUY)
-              {
-               double price = PositionGetDouble(POSITION_PRICE_CURRENT);
-               trailSL = NormalizeDouble(price - m_trailAtrMul * atr,
-                                         (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
-               if(trailSL > curSL && trailSL < price)
-                  m_trade.ModifyPosition(rec.ticket, trailSL, curTP);
-              }
-            else
-              {
-               double price = PositionGetDouble(POSITION_PRICE_CURRENT);
-               trailSL = NormalizeDouble(price + m_trailAtrMul * atr,
-                                         (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
-               if((curSL == 0 || trailSL < curSL) && trailSL > price)
-                  m_trade.ModifyPosition(rec.ticket, trailSL, curTP);
-              }
-           }
-        }
+             if(m_records[i].direction == SIGNAL_BUY)
+               {
+                trailSL = NormalizeDouble(price - m_trailAtrMul * atr,
+                                          (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
+                if(trailSL > curSL && trailSL < price)
+                   m_trade.ModifyPosition(m_records[i].ticket, trailSL, curTP);
+               }
+             else
+               {
+                trailSL = NormalizeDouble(price + m_trailAtrMul * atr,
+                                          (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
+                if((curSL == 0 || trailSL < curSL) && trailSL > price)
+                   m_trade.ModifyPosition(m_records[i].ticket, trailSL, curTP);
+               }
+            }
+         }
      }
 
    //--- Get current R for display purposes
