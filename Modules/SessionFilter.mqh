@@ -1,9 +1,10 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                                 SessionFilter.mqh|
 //|                          EA102 - XAUUSD Prop Firm EA             |
 //|             Trading session filter (London / New York / etc.)    |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef SESSIONFILTER_MQH
+#define SESSIONFILTER_MQH
 #include "Utilities.mqh"
 
 //+------------------------------------------------------------------+
@@ -204,3 +205,4 @@ public:
    bool IsFilterEnabled() const { return m_filterEnabled; }
   };
 //+------------------------------------------------------------------+
+#endif // SESSIONFILTER_MQH

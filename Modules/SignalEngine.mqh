@@ -3,7 +3,8 @@
 //|                          EA102 - XAUUSD Prop Firm EA             |
 //|         HTF Trend Analysis: EMA, Market Structure, RSI           |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef SIGNALENGINE_MQH
+#define SIGNALENGINE_MQH
 #include "Utilities.mqh"
 #include "MarketStructure.mqh"
 
@@ -26,7 +27,7 @@ enum ENUM_SIGNAL_DIR
 //--- Full signal package returned to MainEA
 struct SignalPackage
   {
-   SIGNAL_DIR     direction;
+   ENUM_SIGNAL_DIR direction;
    double         setupScore;   // 0.0 – 1.0 (confluence score)
    string         reason;
    double         suggestedSL;  // 0 = not set
@@ -285,3 +286,4 @@ private:
      }
   };
 //+------------------------------------------------------------------+
+#endif // SIGNALENGINE_MQH

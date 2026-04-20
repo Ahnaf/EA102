@@ -1,9 +1,10 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                                   Dashboard.mqh  |
 //|                          EA102 - XAUUSD Prop Firm EA             |
 //|              On-chart information panel (ChartObjects)           |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef DASHBOARD_MQH
+#define DASHBOARD_MQH
 #include "Utilities.mqh"
 #include "PropProtection.mqh"
 #include "SessionFilter.mqh"
@@ -172,3 +173,4 @@ private:
      }
   };
 //+------------------------------------------------------------------+
+#endif // DASHBOARD_MQH

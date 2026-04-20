@@ -1,9 +1,10 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                                    Utilities.mqh |
 //|                          EA102 - XAUUSD Prop Firm EA             |
 //|                        Shared Utility Functions & Helpers        |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef UTILITIES_MQH
+#define UTILITIES_MQH
 
 //--- Logging levels
 enum ENUM_LOG_LEVEL
@@ -259,3 +260,4 @@ string OrderTypeStr(ENUM_ORDER_TYPE t)
      }
   }
 //+------------------------------------------------------------------+
+#endif // UTILITIES_MQH

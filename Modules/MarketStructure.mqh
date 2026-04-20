@@ -1,9 +1,10 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                               MarketStructure.mqh|
 //|                          EA102 - XAUUSD Prop Firm EA             |
 //|    BOS / CHOCH / Liquidity Sweep / Order Blocks / FVG Detection  |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef MARKETSTRUCTURE_MQH
+#define MARKETSTRUCTURE_MQH
 #include "Utilities.mqh"
 
 //--- Structure type
@@ -519,3 +520,4 @@ public:
      }
   };
 //+------------------------------------------------------------------+
+#endif // MARKETSTRUCTURE_MQH

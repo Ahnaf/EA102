@@ -1,9 +1,10 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                                  EntryEngine.mqh |
 //|                          EA102 - XAUUSD Prop Firm EA             |
 //|        M5 Entry Confirmation: Candle + Momentum + Location       |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef ENTRYENGINE_MQH
+#define ENTRYENGINE_MQH
 #include "Utilities.mqh"
 #include "SignalEngine.mqh"
 
@@ -391,3 +392,4 @@ private:
      }
   };
 //+------------------------------------------------------------------+
+#endif // ENTRYENGINE_MQH

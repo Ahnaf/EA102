@@ -1,9 +1,10 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                                   ExitManager.mqh|
 //|                          EA102 - XAUUSD Prop Firm EA             |
 //|   Break-even, Partial Close, ATR Trailing Stop, Exit Management  |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef EXITMANAGER_MQH
+#define EXITMANAGER_MQH
 #include "Utilities.mqh"
 #include "TradeManager.mqh"
 
@@ -222,3 +223,4 @@ private:
      }
   };
 //+------------------------------------------------------------------+
+#endif // EXITMANAGER_MQH

@@ -10,7 +10,7 @@
 //|  N = News filter passed                                          |
 //|  F = Frequency gate passed                                       |
 //|  T = HTF trend valid                                             |
-//|  U = Setup valid (BOS/CHOCH/OB/FVG)                             |
+//|  U = Setup valid (BOS/CHOCH/OB/FVG)                              |
 //|  E = Entry confirmation (candle + momentum)                      |
 //|  X = Exposure allowed                                            |
 //+------------------------------------------------------------------+

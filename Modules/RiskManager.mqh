@@ -1,9 +1,10 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                                  RiskManager.mqh |
 //|                          EA102 - XAUUSD Prop Firm EA             |
 //|   Lot sizing, exposure control, frequency gate (condition X + F) |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef RISKMANAGER_MQH
+#define RISKMANAGER_MQH
 #include "Utilities.mqh"
 #include "SignalEngine.mqh"
 
@@ -327,3 +328,4 @@ private:
      }
   };
 //+------------------------------------------------------------------+
+#endif // RISKMANAGER_MQH

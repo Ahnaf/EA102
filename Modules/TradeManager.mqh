@@ -1,9 +1,10 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                                 TradeManager.mqh |
 //|                          EA102 - XAUUSD Prop Firm EA             |
 //|              Trade Execution, Modification, and Tracking         |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef TRADEMANAGER_MQH
+#define TRADEMANAGER_MQH
 #include "Utilities.mqh"
 #include "EntryEngine.mqh"
 #include <Trade\Trade.mqh>
@@ -238,3 +239,4 @@ public:
    CTrade *GetTrade()            { return &m_trade; }
   };
 //+------------------------------------------------------------------+
+#endif // TRADEMANAGER_MQH
